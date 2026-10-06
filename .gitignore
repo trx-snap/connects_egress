@@ -1,0 +1,37 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test and coverage artifacts
+*.out
+*.test
+prof.cpu
+prof.mem
+
+# IDE and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Lab data and temporary media chunks
+lab/data/
+lab/recordings/
+*.m4s
+*.mp4
+*.m3u8
+
+# Lab runtime state and generated fixtures
+lab/.logs/
+lab/publishers/.pids/
+lab/publishers/.logs/
+lab/fixtures/*.h264
+lab/fixtures/*.ogg
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example

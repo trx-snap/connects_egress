@@ -1,0 +1,13 @@
+port: 7880
+bind_addresses:
+  - "127.0.0.1"
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50050
+  use_external_ip: false
+keys:
+  devkey: secret78901234567890123456789012
+logging:
+  json: false
+  level: info
