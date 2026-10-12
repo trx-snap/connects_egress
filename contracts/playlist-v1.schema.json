@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "connects-egress atlas playlist metadata, version 1",
+  "description": "The LL-HLS EXT-X-DATERANGE atlas metadata contract for ConnectsApp rendition playlists (plan §4.5, §5.2, §5.3, §7.5). Rendered by writeAtlas in internal/supervisor/playlist_linux.go across room rendition playlists (vhi.m3u8, vmid.m3u8, vlo.m3u8, a.m3u8) at the start of each timeline generation window. The HLS tag attributes are ID, CLASS, START-DATE, X-MODE, X-ATLAS-VERSION, X-SLOTS, and X-CROP-ANCHOR. START-DATE is the authoritative timeline synchronization point aligning to the first video IDR / new atlas segment of the generation (plan §4.5, §5.3); the client player switches layout when the playhead crosses START-DATE. X-SLOTS formalizes the tile mapping (slot -> host_id -> room_id -> normalized 0..1 tile rectangle) in strictly ascending slot index order. Wire encoding freezes writeAtlas: entries are joined by semicolons; each entry is 'slot:escaped_host_id:escaped_room_id:x,y,width,height'; host_id and room_id use application/x-www-form-urlencoded component encoding equivalent to Go url.QueryEscape/url.QueryUnescape (spaces as '+', delimiters percent-encoded). Coordinates x, y, width, height are normalized fractions in 0..1 representing the tile rectangle within the decoded atlas frame, ensuring ABR rung switches never alter layout calculations. Wire format semantics for client decoding: (1) Split X-SLOTS on ';' into slot entry tokens in slot order. (2) Split each entry on ':' into slot index, escaped_host_id, escaped_room_id, and rect coordinates. (3) Parse slot index as an integer. (4) Decode escaped_host_id and escaped_room_id with application/x-www-form-urlencoded decoding ('+' to space, '%XX' to byte). (5) Split rect on ',' into four float numbers [x, y, width, height]. (6) Apply normalized [0..1] coordinates [left, top, width, height] relative to decoded video frame dimensions. Currently supported layouts are constrained to: solo with slot 0 covering [0,0,1,1] ('0,0,1,1'), and 1v1 with slot 0 covering [0,0,0.5,1] ('0,0,0.5,1') and slot 1 covering [0.5,0,0.5,1] ('0.5,0,0.5,1').",
+  "x-contract-version": "1.0.0",
+  "type": "object",
+  "required": [
+    "ID",
+    "CLASS",
+    "START-DATE",
+    "X-MODE",
+    "X-ATLAS-VERSION",
+    "X-SLOTS",
+    "X-CROP-ANCHOR"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "ID": {
+      "type": "string",
+      "pattern": "^atlas-[1-9][0-9]*$",
+      "description": "Identifier for the DATERANGE tag, formatted as 'atlas-{generation}' where generation is the uint64 timeline room binding generation sequence number."
+    },
+    "CLASS": {
+      "const": "com.connectsapp.atlas",
+      "description": "HLS client attribute class identifying ConnectsApp atlas layout metadata."
+    },
+    "START-DATE": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
+      "description": "ISO 8601 UTC date-time timestamp with millisecond precision (e.g. '2023-11-14T22:13:20.000Z'). Authoritative timeline synchronization point: aligns to the first video IDR / new atlas segment of the generation (plan §4.5, §5.3)."
+    },
+    "X-MODE": {
+      "type": "string",
+      "enum": ["solo", "1v1"],
+      "description": "Presentation mode of the atlas. Currently constrained to 'solo' and '1v1'."
+    },
+    "X-ATLAS-VERSION": {
+      "const": "1",
+      "description": "Atlas contract major version; frozen to '1'."
+    },
+    "X-SLOTS": {
+      "$ref": "#/$defs/wireSlots",
+      "description": "Wire-encoded slot entries in strictly ascending slot index order, joined by semicolons. Format per entry: 'slot:escaped_host_id:escaped_room_id:x,y,width,height'. host_id and room_id use application/x-www-form-urlencoded component encoding equivalent to Go url.QueryEscape/url.QueryUnescape (spaces as '+', delimiters percent-encoded). Coordinates x, y, width, height are normalized fractions in 0..1 representing the tile rectangle within the decoded atlas texture."
+    },
+    "X-CROP-ANCHOR": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Normalized vertical crop anchor in [0, 1] applied by the player when adapting atlas tiles to responsive screen aspect ratios (from presentation.crop_anchor)."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "X-MODE": { "const": "solo" } } },
+      "then": {
+        "properties": {
+          "X-SLOTS": { "$ref": "#/$defs/wireSlotsSolo" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "X-MODE": { "const": "1v1" } } },
+      "then": {
+        "properties": {
+          "X-SLOTS": { "$ref": "#/$defs/wireSlots1v1" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "wireSlots": {
+      "type": "string",
+      "oneOf": [
+        { "$ref": "#/$defs/wireSlotsSolo" },
+        { "$ref": "#/$defs/wireSlots1v1" }
+      ],
+      "description": "Wire-encoded X-SLOTS string for currently supported modes (solo or 1v1)."
+    },
+    "wireSlotsSolo": {
+      "type": "string",
+      "pattern": "^0:(?:[a-zA-Z0-9_.~+-]|%(?:[0189A-F][0-9A-F]|2[1-9A-CF]|3[A-F]|40|5[B-E]|60|7[BCDF])){1,256}:(?:[a-zA-Z0-9_.~+-]|%(?:[0189A-F][0-9A-F]|2[1-9A-CF]|3[A-F]|40|5[B-E]|60|7[BCDF])){1,256}:0,0,1,1$",
+      "description": "Solo layout wire encoding: slot 0 covering normalized tile rectangle [0,0,1,1]."
+    },
+    "wireSlots1v1": {
+      "type": "string",
+      "pattern": "^0:((?:[a-zA-Z0-9_.~+-]|%(?:[0189A-F][0-9A-F]|2[1-9A-CF]|3[A-F]|40|5[B-E]|60|7[BCDF])){1,256}):((?:[a-zA-Z0-9_.~+-]|%(?:[0189A-F][0-9A-F]|2[1-9A-CF]|3[A-F]|40|5[B-E]|60|7[BCDF])){1,256}):0,0,0\\.5,1;1:(?!\\1:)((?:[a-zA-Z0-9_.~+-]|%(?:[0189A-F][0-9A-F]|2[1-9A-CF]|3[A-F]|40|5[B-E]|60|7[BCDF])){1,256}):(?!\\2:)((?:[a-zA-Z0-9_.~+-]|%(?:[0189A-F][0-9A-F]|2[1-9A-CF]|3[A-F]|40|5[B-E]|60|7[BCDF])){1,256}):0\\.5,0,0\\.5,1$",
+      "description": "1v1 layout wire encoding: slot 0 covering [0,0,0.5,1] and slot 1 covering [0.5,0,0.5,1], in slot order joined by semicolon."
+    }
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "connects-egress IPC publication packet, protocol major 2 (IPC2)",
+  "description": "One worker/supervisor IPC2 packet: a JSON object of at most x-max-packet-size bytes with envelope version 2, a type and exactly that type's payload. IPC2 is the first deployed wire major; the version 1 envelope was never deployed. The hello, welcome state and entry payloads are the canonical version 1 definitions of ipc-v1.schema.json, carried unchanged and still stamped version 1. Bytes enter the Part Store only through a grant: a reserve names the init or part the worker will publish as entry seq and its length; the grant answers with the exact extent; the publication of an init or part carries that grant, whose seq, kind, track, offset and length must equal the entry's; a phases or terminal publication carries no grant. A welcome's pending grant is present only when one really exists, never on a setup welcome, and is for state.applied+1. Every accepted publication is answered with an ack naming the entry seq. Rules this schema cannot express and the Go validator enforces: the version 1 rules of each carried payload; which track ids a configuration has; sequence continuity, the single in-flight grant and duplicate handling, which belong to the session owner; the encoded size limit.",
+  "x-contract-version": "2.0.0",
+  "x-max-packet-size": 16384,
+  "oneOf": [
+    { "$ref": "#/$defs/helloPacket" },
+    { "$ref": "#/$defs/welcomePacket" },
+    { "$ref": "#/$defs/reservePacket" },
+    { "$ref": "#/$defs/grantPacket" },
+    { "$ref": "#/$defs/publishPacket" },
+    { "$ref": "#/$defs/ackPacket" },
+    { "$ref": "#/$defs/rejectPacket" }
+  ],
+  "$defs": {
+    "envelopeVersion": { "const": 2 },
+    "uint64": { "$ref": "ipc-v1.schema.json#/$defs/uint64" },
+    "int64": { "$ref": "ipc-v1.schema.json#/$defs/int64" },
+    "nonEmptyString": { "$ref": "ipc-v1.schema.json#/$defs/nonEmptyString" },
+    "trackId": { "$ref": "ipc-v1.schema.json#/$defs/trackId" },
+    "grantKind": { "enum": ["init", "part"] },
+
+    "helloPacket": {
+      "type": "object",
+      "required": ["version", "type", "hello"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "hello" },
+        "hello": { "$ref": "ipc-v1.schema.json#/$defs/hello" }
+      }
+    },
+    "welcomePacket": {
+      "type": "object",
+      "required": ["version", "type", "welcome"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "welcome" },
+        "welcome": { "$ref": "#/$defs/welcome" }
+      }
+    },
+    "reservePacket": {
+      "type": "object",
+      "required": ["version", "type", "reserve"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "reserve" },
+        "reserve": { "$ref": "#/$defs/reserve" }
+      }
+    },
+    "grantPacket": {
+      "type": "object",
+      "required": ["version", "type", "grant"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "grant" },
+        "grant": { "$ref": "#/$defs/grant" }
+      }
+    },
+    "publishPacket": {
+      "type": "object",
+      "required": ["version", "type", "publish"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "publish" },
+        "publish": { "$ref": "#/$defs/publish" }
+      }
+    },
+    "ackPacket": {
+      "type": "object",
+      "required": ["version", "type", "ack"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "ack" },
+        "ack": { "$ref": "#/$defs/ack" }
+      }
+    },
+    "rejectPacket": {
+      "type": "object",
+      "required": ["version", "type", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/envelopeVersion" },
+        "type": { "const": "reject" },
+        "reason": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+
+    "reserve": {
+      "type": "object",
+      "required": ["seq", "kind", "track", "length"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": { "$ref": "#/$defs/uint64", "minimum": 1 },
+        "kind": { "$ref": "#/$defs/grantKind" },
+        "track": { "$ref": "#/$defs/trackId" },
+        "length": { "$ref": "#/$defs/int64", "minimum": 1 }
+      }
+    },
+
+    "grant": {
+      "type": "object",
+      "required": ["seq", "id", "kind", "track", "offset", "length"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": { "$ref": "#/$defs/uint64", "minimum": 1 },
+        "id": { "$ref": "#/$defs/uint64", "minimum": 1 },
+        "kind": { "$ref": "#/$defs/grantKind" },
+        "track": { "$ref": "#/$defs/trackId" },
+        "offset": { "$ref": "#/$defs/int64", "minimum": 0 },
+        "length": { "$ref": "#/$defs/int64", "minimum": 1 }
+      }
+    },
+
+    "welcome": {
+      "type": "object",
+      "required": ["state"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "$ref": "ipc-v1.schema.json#/$defs/welcome" },
+        "pending": { "$ref": "#/$defs/grant" }
+      },
+      "if": { "properties": { "state": { "properties": { "setup": { "const": true } } } } },
+      "then": { "not": { "required": ["pending"] } }
+    },
+
+    "publish": {
+      "type": "object",
+      "required": ["entry"],
+      "additionalProperties": false,
+      "properties": {
+        "entry": { "$ref": "ipc-v1.schema.json#/$defs/entry" },
+        "grant": { "$ref": "#/$defs/grant" }
+      },
+      "if": { "properties": { "entry": { "properties": { "kind": { "enum": ["init", "part"] } } } } },
+      "then": { "required": ["grant"] },
+      "else": { "not": { "required": ["grant"] } }
+    },
+
+    "ack": {
+      "type": "object",
+      "required": ["seq"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": { "$ref": "#/$defs/uint64", "minimum": 1 }
+      }
+    }
+  }
+}

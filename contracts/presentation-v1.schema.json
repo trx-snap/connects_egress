@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "connects-egress source presentation, version 1",
+  "description": "The immutable presentation mapping of one source epoch, written once by the producer as presentation.json in the epoch directory before its first part and read by the supervisor's room timelines. It maps every track's raw PTS to pipeline running time (running_time_origin_ns + (pts - raw_pts_origin_ns)), the pipeline's running time zero to UTC (pipeline_utc_ns, with uncertainty_ns), names the atlas crop anchor and the host and room of every atlas slot (the slot is the array index). It is a declared mapping, never a capture or lip-sync proof, and never derived from publication time. Rules the Go validator enforces beyond this schema: clocks has exactly config.tracks entries with clocks[i].track = i; the three video clocks (tracks 0..2) are identical; slots has one entry for solo and two for 1v1; host and room identities are unique, valid UTF-8 without control characters and at most 256 bytes; crop_anchor is finite; the encoded document is canonical (property order as listed, no insignificant whitespace) and at most x-max-size bytes.",
+  "x-contract-version": "1.0.0",
+  "x-max-size": 16384,
+  "type": "object",
+  "required": ["version", "run", "source", "epoch", "config", "pipeline_utc_ns", "uncertainty_ns", "crop_anchor", "clocks", "slots"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "run": { "$ref": "ipc-v1.schema.json#/$defs/nonEmptyString" },
+    "source": { "$ref": "ipc-v1.schema.json#/$defs/nonEmptyString" },
+    "epoch": { "$ref": "ipc-v1.schema.json#/$defs/uint64", "minimum": 1 },
+    "config": { "$ref": "ipc-v1.schema.json#/$defs/config" },
+    "pipeline_utc_ns": { "$ref": "ipc-v1.schema.json#/$defs/int64", "minimum": 1 },
+    "uncertainty_ns": { "$ref": "ipc-v1.schema.json#/$defs/int64", "minimum": 0 },
+    "crop_anchor": { "type": "number", "minimum": 0, "maximum": 1 },
+    "clocks": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/trackClock" }
+    },
+    "slots": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/slot" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "config": { "properties": { "mode": { "const": "solo" } } } } },
+      "then": { "properties": { "clocks": { "maxItems": 4 }, "slots": { "maxItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "config": { "properties": { "mode": { "const": "1v1" } } } } },
+      "then": { "properties": { "clocks": { "minItems": 5 }, "slots": { "minItems": 2 } } }
+    }
+  ],
+  "$defs": {
+    "trackClock": {
+      "type": "object",
+      "required": ["track", "raw_pts_origin_ns", "running_time_origin_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "track": { "$ref": "ipc-v1.schema.json#/$defs/trackId" },
+        "raw_pts_origin_ns": { "$ref": "ipc-v1.schema.json#/$defs/int64", "minimum": 0 },
+        "running_time_origin_ns": { "$ref": "ipc-v1.schema.json#/$defs/int64", "minimum": 0 }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "required": ["host_id", "room_id"],
+      "additionalProperties": false,
+      "properties": {
+        "host_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "room_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  }
+}

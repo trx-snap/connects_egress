@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "connects-egress IPC packet, protocol major 1",
+  "description": "One worker/supervisor IPC packet: a JSON object of at most x-max-packet-size bytes with a type and exactly that type's payload. Version 1 is the first production major; version 0 and unknown future majors are rejected. Descriptors are descriptions only; the transport carries the file descriptors themselves. Rules this schema cannot express and the Go validator enforces: a reconnect hello lists exactly config.tracks descriptors, each sized config.capacity; a descriptor list names each track 0..count-1 exactly once; an init or part span's offset+length does not overflow int64; the encoded size limit. Matching a welcome to its hello and sequence continuity belong to the session owner.",
+  "x-contract-version": "1.0.0",
+  "x-max-packet-size": 16384,
+  "oneOf": [
+    { "$ref": "#/$defs/helloPacket" },
+    { "$ref": "#/$defs/welcomePacket" },
+    { "$ref": "#/$defs/entryPacket" },
+    { "$ref": "#/$defs/rejectPacket" }
+  ],
+  "$defs": {
+    "uint64": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+    "int64": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 },
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "trackId": { "type": "integer", "minimum": 0, "maximum": 4 },
+
+    "helloPacket": {
+      "type": "object",
+      "required": ["type", "hello"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "hello" },
+        "hello": { "$ref": "#/$defs/hello" }
+      }
+    },
+    "welcomePacket": {
+      "type": "object",
+      "required": ["type", "welcome"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "welcome" },
+        "welcome": { "$ref": "#/$defs/welcome" }
+      }
+    },
+    "entryPacket": {
+      "type": "object",
+      "required": ["type", "entry"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "entry" },
+        "entry": { "$ref": "#/$defs/entry" }
+      }
+    },
+    "rejectPacket": {
+      "type": "object",
+      "required": ["type", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "reject" },
+        "reason": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+
+    "config": {
+      "type": "object",
+      "required": ["mode", "codec", "tracks", "capacity"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["solo", "1v1"] },
+        "codec": { "enum": ["h264", "hevc"] },
+        "tracks": { "enum": [4, 5] },
+        "capacity": { "$ref": "#/$defs/int64", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "solo" } } },
+          "then": { "properties": { "tracks": { "const": 4 } } }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "1v1" } } },
+          "then": { "properties": { "tracks": { "const": 5 } } }
+        }
+      ]
+    },
+
+    "fdIdentity": {
+      "type": "object",
+      "required": ["track", "name", "dev", "ino", "size"],
+      "additionalProperties": false,
+      "properties": {
+        "track": { "$ref": "#/$defs/trackId" },
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "dev": { "$ref": "#/$defs/uint64" },
+        "ino": { "$ref": "#/$defs/uint64" },
+        "size": { "$ref": "#/$defs/int64", "minimum": 1 }
+      }
+    },
+    "fdIdentities": {
+      "type": "array",
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/fdIdentity" }
+    },
+
+    "hello": {
+      "type": "object",
+      "required": ["version", "run", "source", "epoch", "pid", "config", "tracks", "high"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "const": 1 },
+        "run": { "$ref": "#/$defs/nonEmptyString" },
+        "source": { "$ref": "#/$defs/nonEmptyString" },
+        "epoch": { "$ref": "#/$defs/uint64" },
+        "pid": { "$ref": "#/$defs/int64", "minimum": 1 },
+        "config": { "$ref": "#/$defs/config" },
+        "tracks": { "$ref": "#/$defs/fdIdentities" },
+        "high": { "$ref": "#/$defs/uint64" }
+      },
+      "if": { "properties": { "epoch": { "const": 0 } } },
+      "then": { "properties": { "tracks": { "maxItems": 0 } } },
+      "else": { "properties": { "tracks": { "minItems": 4 } } }
+    },
+
+    "welcome": {
+      "type": "object",
+      "required": ["version", "run", "source", "epoch", "setup", "applied", "tracks"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "const": 1 },
+        "run": { "$ref": "#/$defs/nonEmptyString" },
+        "source": { "$ref": "#/$defs/nonEmptyString" },
+        "epoch": { "$ref": "#/$defs/uint64", "minimum": 1 },
+        "setup": { "type": "boolean" },
+        "applied": { "$ref": "#/$defs/uint64" },
+        "tracks": { "$ref": "#/$defs/fdIdentities" }
+      },
+      "if": { "properties": { "setup": { "const": true } } },
+      "then": { "properties": { "tracks": { "minItems": 4 } } },
+      "else": { "properties": { "tracks": { "maxItems": 0 } } }
+    },
+
+    "entry": {
+      "type": "object",
+      "required": [
+        "version", "run", "source", "epoch", "seq", "kind", "track", "published_ns", "published_mono_ns",
+        "offset", "length", "phase_video_ns", "phase_audio_ns",
+        "msn", "part", "pts_ns", "dts_ns", "duration_ns", "sequence",
+        "fragment_start", "independent", "payload_buffers", "first_au", "verified"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "const": 1 },
+        "run": { "$ref": "#/$defs/nonEmptyString" },
+        "source": { "$ref": "#/$defs/nonEmptyString" },
+        "epoch": { "$ref": "#/$defs/uint64", "minimum": 1 },
+        "seq": { "$ref": "#/$defs/uint64", "minimum": 1 },
+        "kind": { "enum": ["init", "phases", "part", "terminal"] },
+        "track": { "type": "integer", "minimum": -1, "maximum": 4 },
+        "published_ns": { "$ref": "#/$defs/int64" },
+        "published_mono_ns": { "$ref": "#/$defs/int64" },
+        "offset": { "$ref": "#/$defs/int64" },
+        "length": { "$ref": "#/$defs/int64" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "codecs": { "$ref": "#/$defs/nonEmptyString" },
+        "phase_video_ns": { "$ref": "#/$defs/int64" },
+        "phase_audio_ns": { "$ref": "#/$defs/int64" },
+        "msn": { "$ref": "#/$defs/int64" },
+        "part": { "$ref": "#/$defs/int64" },
+        "pts_ns": { "$ref": "#/$defs/int64" },
+        "dts_ns": { "$ref": "#/$defs/int64" },
+        "duration_ns": { "$ref": "#/$defs/int64" },
+        "sequence": { "$ref": "#/$defs/uint64" },
+        "fragment_start": { "type": "boolean" },
+        "independent": { "type": "boolean" },
+        "payload_buffers": { "$ref": "#/$defs/int64" },
+        "first_au": { "$ref": "#/$defs/int64" },
+        "verified": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "oneOf": [
+        { "$ref": "#/$defs/initEntry" },
+        { "$ref": "#/$defs/phasesEntry" },
+        { "$ref": "#/$defs/partEntry" },
+        { "$ref": "#/$defs/terminalEntry" }
+      ]
+    },
+
+    "initEntry": {
+      "allOf": [
+        { "properties": { "kind": { "const": "init" }, "track": { "minimum": 0 } } },
+        { "$ref": "#/$defs/entrySpan" },
+        { "required": ["codecs"] },
+        { "$ref": "#/$defs/entryNoPhases" },
+        { "$ref": "#/$defs/entryNoPart" },
+        { "$ref": "#/$defs/entryNoVerdict" }
+      ]
+    },
+    "phasesEntry": {
+      "allOf": [
+        { "properties": { "kind": { "const": "phases" }, "track": { "minimum": 0 } } },
+        { "$ref": "#/$defs/entryNoSpan" },
+        { "$ref": "#/$defs/entryNoCodecs" },
+        { "properties": { "phase_video_ns": { "minimum": 0 }, "phase_audio_ns": { "minimum": 0 } } },
+        { "$ref": "#/$defs/entryNoPart" },
+        { "$ref": "#/$defs/entryNoVerdict" }
+      ]
+    },
+    "partEntry": {
+      "allOf": [
+        { "properties": { "kind": { "const": "part" }, "track": { "minimum": 0 } } },
+        { "$ref": "#/$defs/entrySpan" },
+        { "$ref": "#/$defs/entryNoCodecs" },
+        { "$ref": "#/$defs/entryNoPhases" },
+        {
+          "properties": {
+            "msn": { "minimum": 1 },
+            "part": { "minimum": 0 },
+            "pts_ns": { "minimum": 0 },
+            "dts_ns": { "minimum": 0 },
+            "duration_ns": { "minimum": 1 },
+            "payload_buffers": { "minimum": 1 },
+            "first_au": { "minimum": 0 }
+          }
+        },
+        { "$ref": "#/$defs/entryNoVerdict" }
+      ]
+    },
+    "terminalEntry": {
+      "allOf": [
+        { "properties": { "kind": { "const": "terminal" }, "track": { "const": -1 } } },
+        { "$ref": "#/$defs/entryNoSpan" },
+        { "$ref": "#/$defs/entryNoCodecs" },
+        { "$ref": "#/$defs/entryNoPhases" },
+        { "$ref": "#/$defs/entryNoPart" }
+      ]
+    },
+
+    "entrySpan": {
+      "properties": { "offset": { "minimum": 0 }, "length": { "minimum": 1 } },
+      "required": ["sha256"]
+    },
+    "entryNoSpan": {
+      "properties": { "offset": { "const": 0 }, "length": { "const": 0 } },
+      "not": { "required": ["sha256"] }
+    },
+    "entryNoCodecs": { "not": { "required": ["codecs"] } },
+    "entryNoPhases": {
+      "properties": { "phase_video_ns": { "const": 0 }, "phase_audio_ns": { "const": 0 } }
+    },
+    "entryNoPart": {
+      "properties": {
+        "msn": { "const": 0 },
+        "part": { "const": 0 },
+        "pts_ns": { "const": 0 },
+        "dts_ns": { "const": 0 },
+        "duration_ns": { "const": 0 },
+        "sequence": { "const": 0 },
+        "fragment_start": { "const": false },
+        "independent": { "const": false },
+        "payload_buffers": { "const": 0 },
+        "first_au": { "const": 0 }
+      }
+    },
+    "entryNoVerdict": {
+      "properties": { "verified": { "const": false } },
+      "not": { "required": ["reason"] }
+    }
+  }
+}
