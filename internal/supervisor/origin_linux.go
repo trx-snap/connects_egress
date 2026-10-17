@@ -11,9 +11,11 @@ package supervisor
 // Playlists are rendered from an owned TimelineSnapshot. _HLS_msn and _HLS_part are evaluated
 // against room MSNs and hold the request, without a goroutine, until the room exposes that segment
 // or part, the room ends, three part targets pass (503) or the client leaves (nothing is written).
-// _HLS_skip=YES asks for a delta playlist. Media bytes are resolved by their full epoch key and
-// source track, served immutable with GET, HEAD and byte ranges; what the Source does not retain,
-// and an open segment asked for whole, is 404. A malformed route or query is 400.
+// _HLS_skip=YES asks for a delta playlist. A room is resolved through a RoomIndex: a room the
+// index knows without an active run is 503, never the media of an earlier run, and an unknown
+// room is 404. Media bytes are resolved by their full epoch key and source track, served
+// immutable with GET, HEAD and byte ranges; what the Source does not retain, and an open segment
+// asked for whole, is 404. A malformed route or query is 400.
 
 import (
 	"bytes"
@@ -33,13 +35,34 @@ import (
 
 const mediaCacheControl = "public, max-age=31536000, immutable"
 
-// Origin serves one controller's rooms. See the file comment.
-type Origin struct {
-	c *PlaybackController
+// RoomIndex resolves the room of a /live/ request. Lookup returns the timeline serving the
+// room's active run; Inactive reports a room the index knows that has no active run, whose
+// playlists are unavailable rather than unknown.
+type RoomIndex interface {
+	Lookup(room string) (*Timeline, bool)
+	Inactive(room string) bool
 }
 
-// NewOrigin returns the origin of c.
-func NewOrigin(c *PlaybackController) *Origin { return &Origin{c: c} }
+// Origin serves one controller's rooms. See the file comment.
+type Origin struct {
+	c     *PlaybackController
+	rooms RoomIndex
+}
+
+// NewOrigin returns the origin of c: its registered timelines are the rooms, every other room
+// is unknown.
+func NewOrigin(c *PlaybackController) *Origin { return &Origin{c: c, rooms: registry{c}} }
+
+// NewRoomOrigin returns an origin resolving rooms through rooms and media through c.
+func NewRoomOrigin(c *PlaybackController, rooms RoomIndex) *Origin {
+	return &Origin{c: c, rooms: rooms}
+}
+
+// registry is the RoomIndex of a controller's registered timelines alone.
+type registry struct{ c *PlaybackController }
+
+func (r registry) Lookup(room string) (*Timeline, bool) { return r.c.Lookup(room) }
+func (registry) Inactive(string) bool                   { return false }
 
 // ServeHTTP implements http.Handler.
 func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -81,8 +104,12 @@ func splitPath(escaped string) ([]string, bool) {
 
 // playlist serves one playlist of room.
 func (o *Origin) playlist(w http.ResponseWriter, r *http.Request, room, name string) {
-	tl, ok := o.c.Lookup(room)
+	tl, ok := o.rooms.Lookup(room)
 	if !ok {
+		if o.rooms.Inactive(room) {
+			http.Error(w, "the room has no active run", http.StatusServiceUnavailable)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}

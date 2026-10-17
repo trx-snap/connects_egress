@@ -85,13 +85,16 @@ type origins struct {
 	haveVideo, haveAudio                 bool
 }
 
-// RunnerOptions configure Run. EpochDir maps the epoch the supervisor assigns to the directory
-// the presentation is written into.
+// RunnerOptions configure Run. Room is the LiveKit room to join and RoomID the room identity the
+// presentation's slot names, which the supervisor serves the playlists under; they are distinct
+// identities that may share a value. EpochDir maps the epoch the supervisor assigns to the
+// directory the presentation is written into.
 type RunnerOptions struct {
 	Socket        string
 	Run           string
 	Source        string
 	Room          string
+	RoomID        string
 	Host          string
 	URL           string
 	APIKey        string
@@ -153,7 +156,7 @@ func Run(ctx context.Context, o RunnerOptions) error {
 	if err := r.measureOrigin(); err != nil {
 		return err
 	}
-	r.log.Printf("pipeline playing for run %q source %q: room %q host %q, pipeline utc origin %d ns ± %d ns", o.Run, o.Source, o.Room, o.Host, r.utc0, r.uncert)
+	r.log.Printf("pipeline playing for run %q source %q: LiveKit room %q host %q presented as room %q, pipeline utc origin %d ns ± %d ns", o.Run, o.Source, o.Room, o.Host, o.RoomID, r.utc0, r.uncert)
 	return r.generate(ctx)
 }
 
@@ -161,8 +164,8 @@ func checkRunnerOptions(o RunnerOptions) error {
 	switch {
 	case !filepath.IsAbs(o.Socket):
 		return fmt.Errorf("%w: socket %q is not absolute", ErrInvalidOptions, o.Socket)
-	case o.Room == "" || o.Host == "" || o.URL == "":
-		return fmt.Errorf("%w: room, host and url are required", ErrInvalidOptions)
+	case o.Room == "" || o.RoomID == "" || o.Host == "" || o.URL == "":
+		return fmt.Errorf("%w: room, room id, host and url are required", ErrInvalidOptions)
 	case o.APIKey == "" || o.APISecret == "":
 		return fmt.Errorf("%w: LiveKit api key and secret are required", ErrInvalidOptions)
 	case o.EpochDir == nil:
@@ -424,7 +427,7 @@ func (r *runner) ensurePresentation() error {
 	clocks[trackAudio] = ipc.TrackClock{Track: trackAudio, RawPTSOriginNS: og.audioPTS, RunningTimeOriginNS: og.audioRT}
 	pres := ipc.Presentation{Version: ipc.PresentationVersion, Run: r.o.Run, Source: r.o.Source, Epoch: epoch, Config: cfg,
 		PipelineUTCNS: r.utc0, UncertaintyNS: r.uncert, CropAnchor: 0.5, Clocks: clocks,
-		Slots: []ipc.PresentationSlot{{HostID: r.o.Host, RoomID: r.o.Room}}}
+		Slots: []ipc.PresentationSlot{{HostID: r.o.Host, RoomID: r.o.RoomID}}}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.presented {
