@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	nodeTestWait     = 5 * time.Second
+	nodeTestWait     = 10 * time.Second
 	nodeTestURL      = "ws://127.0.0.1:7880"
 	nodeHelperSocket = "CONNECTS_EGRESS_NODE_TEST_SOCKET"
 	nodeHelperRun    = "CONNECTS_EGRESS_NODE_TEST_RUN"
@@ -757,19 +757,28 @@ func TestNodeRunEndsOnVerifiedTerminal(t *testing.T) {
 	if st.Reason != "host left" || st.EndedAt.IsZero() {
 		t.Fatalf("ended status %+v", st)
 	}
-	r.expect("/live/room_a/master.m3u8", http.StatusServiceUnavailable)
-	r.expect("/live/room_a/vhi.m3u8", http.StatusServiceUnavailable)
-	if _, ok := r.n.Lookup("room_a"); ok || !r.n.Inactive("room_a") {
-		t.Fatalf("room_a still looked up, or not inactive")
+	r.waitLog("final playlist served for")
+	// The final playlist is served through the 6-second grace, carrying EXT-X-ENDLIST.
+	otContains(t, r.expect("/live/room_a/master.m3u8", http.StatusOK), "vhi.m3u8")
+	otContains(t, r.expect("/live/room_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_a"); !ok || !r.n.Inactive("room_a") {
+		t.Fatalf("room_a not looked up during grace, or not inactive")
 	}
 	r.waitStops("run-1", 1) // the verified terminal asks the unit to stop, once
 	if _, err := os.Stat(r.socket("run-1")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("run socket after the end: %v", err)
 	}
-	// The epoch stays readable until the worker is gone, then is released with its descriptors.
+	// The epoch and its media stay readable through the grace, even once the worker is gone.
 	r.expect(mediaPath("run-1", "vhi/init.mp4"), http.StatusOK)
 	_ = pub.Close()
 	r.l.unit("run-1").gone(systemd.Exit{})
+	r.expect(mediaPath("run-1", "vhi/init.mp4"), http.StatusOK)
+	// Once the grace expires, playlists are withdrawn (503) and the epoch is released.
+	r.waitGet("/live/room_a/master.m3u8", http.StatusServiceUnavailable)
+	r.waitGet("/live/room_a/vhi.m3u8", http.StatusServiceUnavailable)
+	if _, ok := r.n.Lookup("room_a"); ok || !r.n.Inactive("room_a") {
+		t.Fatalf("room_a still looked up after grace, or not inactive")
+	}
 	r.waitGet(mediaPath("run-1", "vhi/init.mp4"), http.StatusNotFound)
 	r.waitStore(0, nodeTestCfg.Tracks)
 	// Settled once: the late unit exit changed nothing.
@@ -1124,7 +1133,8 @@ func TestNodeRoomsAreIndependent(t *testing.T) {
 	r.expect("/live/room_p/vhi.m3u8", http.StatusOK)
 	r.publishTerminal(pubA, true, "host left")
 	r.waitState("run-20", RunEnded)
-	r.expect("/live/room_o/vhi.m3u8", http.StatusServiceUnavailable)
+	r.waitLog("final playlist served for")
+	otContains(t, r.expect("/live/room_o/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
 	otContains(t, r.expect("/live/room_p/vhi.m3u8", http.StatusOK), mediaPath("run-21", "vhi/1.0.m4s"))
 	if st := r.status("run-21"); st.State != RunRunning {
 		t.Fatalf("room_p run %+v", st)
@@ -1441,10 +1451,13 @@ func TestNodeRestartReadoptsLiveWorker(t *testing.T) {
 	}
 	r2.publishTerminal(pub, true, "host left")
 	r2.waitState("run-30", RunEnded)
-	r2.expect("/live/room_y/vhi.m3u8", http.StatusServiceUnavailable)
+	r2.waitLog("final playlist served for")
+	// The final playlist is served through the grace with EXT-X-ENDLIST.
+	otContains(t, r2.expect("/live/room_y/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
 	_ = pub.Close()
 	l.unit("run-30").gone(systemd.Exit{})
 	r2.waitGet(mediaPath("run-30", "vhi/init.mp4"), http.StatusNotFound)
+	r2.waitGet("/live/room_y/vhi.m3u8", http.StatusServiceUnavailable)
 	r2.waitStore(0, nodeTestCfg.Tracks)
 	r2.teardown()
 
@@ -2222,5 +2235,217 @@ func TestBoundReason(t *testing.T) {
 	}
 	if got := boundReason("ok\xff"); got != "ok?" {
 		t.Fatalf("invalid UTF-8: %q", got)
+	}
+}
+
+func TestNodeCleanEndGraceServesEndlistAndWithdraws(t *testing.T) {
+	r := newNodeRig(t)
+	spec := r.spec("run-grace-1", "room_grace_a")
+	pub := r.running(spec)
+	r.publishPart(pub, 1, 1)
+	r.waitGet("/live/room_grace_a/vhi.m3u8?_HLS_msn=1&_HLS_part=1", http.StatusOK)
+
+	// Clean end via verified terminal.
+	r.publishTerminal(pub, true, "host left")
+	st := r.waitState("run-grace-1", RunEnded)
+	if st.Reason != "host left" || st.EndedAt.IsZero() {
+		t.Fatalf("unexpected ended status %+v", st)
+	}
+	r.waitLog("final playlist served for")
+
+	// 1. Clean end serves final playlists with #EXT-X-ENDLIST during grace.
+	master := r.expect("/live/room_grace_a/master.m3u8", http.StatusOK)
+	otContains(t, master, "vhi.m3u8")
+	vhi := r.expect("/live/room_grace_a/vhi.m3u8", http.StatusOK)
+	otContains(t, vhi, "#EXT-X-ENDLIST\n")
+
+	// Media and lookup remain available during grace even after the worker unit is gone.
+	if _, ok := r.n.Lookup("room_grace_a"); !ok {
+		t.Fatalf("Lookup returned false during clean-end grace")
+	}
+	r.expect(mediaPath("run-grace-1", "vhi/init.mp4"), http.StatusOK)
+	r.expect(mediaPath("run-grace-1", "vhi/1.0.m4s"), http.StatusOK)
+
+	_ = pub.Close()
+	r.l.unit("run-grace-1").gone(systemd.Exit{})
+
+	// Still served while grace has not expired.
+	r.expect(mediaPath("run-grace-1", "vhi/init.mp4"), http.StatusOK)
+	otContains(t, r.expect("/live/room_grace_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+
+	// 2. Playlists/media withdraw and epoch descriptors release after grace.
+	r.waitGet("/live/room_grace_a/master.m3u8", http.StatusServiceUnavailable)
+	r.waitGet("/live/room_grace_a/vhi.m3u8", http.StatusServiceUnavailable)
+	if _, ok := r.n.Lookup("room_grace_a"); ok {
+		t.Fatalf("Lookup still returned true after grace expired")
+	}
+	if !r.n.Inactive("room_grace_a") {
+		t.Fatalf("room_grace_a not reported inactive after grace expired")
+	}
+	r.waitGet(mediaPath("run-grace-1", "vhi/init.mp4"), http.StatusNotFound)
+	r.waitStore(0, nodeTestCfg.Tracks)
+	if _, err := r.n.resolve(EpochKey{Run: "run-grace-1", Source: "run-grace-1", Epoch: 1}); !errors.Is(err, ErrLostEpoch) {
+		t.Fatalf("epoch still resolves after grace: %v", err)
+	}
+}
+
+func TestNodeSupersededDuringGracePermanentOnLaunchFailure(t *testing.T) {
+	r := newNodeRig(t)
+	spec1 := r.spec("run-sup-1", "room_sup_a")
+	pub1 := r.running(spec1)
+	r.publishPart(pub1, 1, 1)
+	r.waitGet("/live/room_sup_a/vhi.m3u8?_HLS_msn=1&_HLS_part=1", http.StatusOK)
+
+	r.publishTerminal(pub1, true, "host left")
+	r.waitState("run-sup-1", RunEnded)
+	r.waitLog("final playlist served for")
+	_ = pub1.Close()
+	r.l.unit("run-sup-1").gone(systemd.Exit{})
+
+	// Verify during grace that final playlist is active.
+	otContains(t, r.expect("/live/room_sup_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_sup_a"); !ok {
+		t.Fatalf("Lookup returned false during grace")
+	}
+
+	// Now arm the launcher to fail starting the next run.
+	r.l.mu.Lock()
+	r.l.startErr = fmt.Errorf("%w: simulated launch failure", systemd.ErrLaunch)
+	r.l.mu.Unlock()
+
+	spec2 := r.spec("run-sup-2", "room_sup_a")
+	if _, _, err := r.n.Start(context.Background(), spec2); err == nil {
+		t.Fatalf("Start succeeded despite launcher failure")
+	}
+
+	// 3a. Supersession is permanent even when the newer run's launch fails and rolls back.
+	// Old run's final playlist and media must NOT be revived or served.
+	if _, ok := r.n.Lookup("room_sup_a"); ok {
+		t.Fatalf("Lookup returned true after supersession and launch rollback")
+	}
+	r.expect("/live/room_sup_a/master.m3u8", http.StatusServiceUnavailable)
+	r.expect("/live/room_sup_a/vhi.m3u8", http.StatusServiceUnavailable)
+	r.waitGet(mediaPath("run-sup-1", "vhi/init.mp4"), http.StatusNotFound)
+	r.waitStore(0, nodeTestCfg.Tracks)
+
+	// A valid launch can now claim the free room.
+	r.l.mu.Lock()
+	r.l.startErr = nil
+	r.l.mu.Unlock()
+
+	spec3 := r.spec("run-sup-3", "room_sup_a")
+	pub3 := r.running(spec3)
+	r.expect("/live/room_sup_a/vhi.m3u8", http.StatusOK)
+	_ = pub3.Close()
+	r.l.unit("run-sup-3").gone(systemd.Exit{Known: true, Result: "signal", Code: "killed", Status: 9})
+}
+
+func TestNodeSupersededDuringGracePermanentOnLaterRunFailure(t *testing.T) {
+	r := newNodeRig(t)
+	spec1 := r.spec("run-sup-4", "room_sup_b")
+	pub1 := r.running(spec1)
+	r.publishTerminal(pub1, true, "host left")
+	r.waitState("run-sup-4", RunEnded)
+	r.waitLog("final playlist served for")
+	_ = pub1.Close()
+	r.l.unit("run-sup-4").gone(systemd.Exit{})
+
+	otContains(t, r.expect("/live/room_sup_b/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+
+	// Start a second run for the room. It succeeds and becomes running.
+	spec2 := r.spec("run-sup-5", "room_sup_b")
+	pub2 := r.running(spec2)
+	r.expect("/live/room_sup_b/vhi.m3u8", http.StatusOK)
+
+	// Now run-sup-5 fails (e.g. worker process killed unexpectedly).
+	_ = pub2.Close()
+	r.l.unit("run-sup-5").gone(systemd.Exit{Known: true, Result: "signal", Code: "killed", Status: 9})
+	r.waitState("run-sup-5", RunFailed)
+
+	// 3b. Old run-sup-4 remains permanently superseded; failure of the new run does not revive it.
+	if _, ok := r.n.Lookup("room_sup_b"); ok {
+		t.Fatalf("Lookup returned true after newer run failed")
+	}
+	r.expect("/live/room_sup_b/master.m3u8", http.StatusServiceUnavailable)
+	r.expect("/live/room_sup_b/vhi.m3u8", http.StatusServiceUnavailable)
+	r.expect(mediaPath("run-sup-4", "vhi/init.mp4"), http.StatusNotFound)
+}
+
+func TestNodeNonSupersedingOperationsDuringGrace(t *testing.T) {
+	r := newNodeRig(t)
+	spec := r.spec("run-ns-1", "room_ns_a")
+	pub := r.running(spec)
+	r.publishTerminal(pub, true, "host left")
+	r.waitState("run-ns-1", RunEnded)
+	r.waitLog("final playlist served for")
+	_ = pub.Close()
+
+	// In grace:
+	otContains(t, r.expect("/live/room_ns_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_ns_a"); !ok {
+		t.Fatalf("Lookup returned false during clean-end grace")
+	}
+
+	ctx := context.Background()
+
+	// 4a. Invalid request (empty RoomID) does not supersede.
+	if _, _, err := r.n.Start(ctx, RunSpec{RunID: "invalid-1", RoomID: "", LiveKitURL: nodeTestURL}); err == nil {
+		t.Fatalf("Start with empty RoomID succeeded")
+	}
+	otContains(t, r.expect("/live/room_ns_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_ns_a"); !ok {
+		t.Fatalf("Lookup false after invalid RoomID")
+	}
+
+	// 4b. Invalid request (empty LiveKitURL) does not supersede.
+	if _, _, err := r.n.Start(ctx, RunSpec{RunID: "invalid-2", RoomID: "room_ns_a", LiveKitURL: ""}); err == nil {
+		t.Fatalf("Start with empty LiveKitURL succeeded")
+	}
+	otContains(t, r.expect("/live/room_ns_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_ns_a"); !ok {
+		t.Fatalf("Lookup false after invalid LiveKitURL")
+	}
+
+	// 4c. Idempotent retry of the ended run does not supersede.
+	st, created, err := r.n.Start(ctx, r.spec("run-ns-1", "room_ns_a"))
+	if err != nil || created || st.State != RunEnded {
+		t.Fatalf("idempotent Start: %+v, %v, %v", st, created, err)
+	}
+	otContains(t, r.expect("/live/room_ns_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_ns_a"); !ok {
+		t.Fatalf("Lookup false after idempotent Start")
+	}
+
+	// 4e. Conflict (same run ID with different room) does not supersede.
+	if _, _, err := r.n.Start(ctx, r.spec("run-ns-1", "room_other")); !errors.Is(err, ErrRunConflict) {
+		t.Fatalf("conflicting Start: %v, want ErrRunConflict", err)
+	}
+	otContains(t, r.expect("/live/room_ns_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_ns_a"); !ok {
+		t.Fatalf("Lookup false after conflicting Start")
+	}
+
+	// 4f. A wait on an owned room that cancels before the room is retired does not supersede.
+	specOwned := r.spec("run-owned", "room_owned")
+	pubOwned := r.running(specOwned)
+	r.publishTerminal(pubOwned, true, "host left")
+	r.waitState("run-owned", RunEnded)
+	// The run is terminal but its unit is not gone yet, so room_owned is still owned in n.rooms.
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := r.n.Start(canceledCtx, r.spec("run-owned-2", "room_owned")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start on owned room with canceled ctx: %v, want context.Canceled", err)
+	}
+	_ = pubOwned.Close()
+	r.l.unit("run-owned").gone(systemd.Exit{})
+
+	// 4g. Status query on the ended run does not supersede.
+	statSt, err := r.n.Status(ctx, "run-ns-1")
+	if err != nil || statSt.State != RunEnded {
+		t.Fatalf("Status on ended run: %+v, %v", statSt, err)
+	}
+	otContains(t, r.expect("/live/room_ns_a/vhi.m3u8", http.StatusOK), "#EXT-X-ENDLIST\n")
+	if _, ok := r.n.Lookup("room_ns_a"); !ok {
+		t.Fatalf("Lookup false after Status")
 	}
 }

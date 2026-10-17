@@ -13,7 +13,9 @@ package supervisor
 // or part, the room ends, three part targets pass (503) or the client leaves (nothing is written).
 // _HLS_skip=YES asks for a delta playlist. A room is resolved through a RoomIndex: a room the
 // index knows without an active run is 503, never the media of an earlier run, and an unknown
-// room is 404. Media bytes are resolved by their full epoch key and source track, served
+// room is 404; the index may resolve a room whose run ended cleanly to its final, ended
+// timeline for a while, whose playlists carry EXT-X-ENDLIST, and a timeline closed meanwhile is
+// 503 as well. Media bytes are resolved by their full epoch key and source track, served
 // immutable with GET, HEAD and byte ranges; what the Source does not retain, and an open segment
 // asked for whole, is 404. A malformed route or query is 400.
 
@@ -115,6 +117,9 @@ func (o *Origin) playlist(w http.ResponseWriter, r *http.Request, room, name str
 	}
 	if name == "master.m3u8" {
 		snap, _, err := tl.Observe()
+		if closedRoom(w, err) {
+			return
+		}
 		body, ok := renderMaster(snap)
 		if err != nil || !ok {
 			http.NotFound(w, r)
@@ -134,6 +139,9 @@ func (o *Origin) playlist(w http.ResponseWriter, r *http.Request, room, name str
 		return
 	}
 	snap, changed, err := tl.Observe()
+	if closedRoom(w, err) {
+		return
+	}
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -155,12 +163,24 @@ func (o *Origin) playlist(w http.ResponseWriter, r *http.Request, room, name str
 				return
 			}
 			if snap, changed, err = tl.Observe(); err != nil {
-				http.NotFound(w, r)
+				if !closedRoom(w, err) {
+					http.NotFound(w, r)
+				}
 				return
 			}
 		}
 	}
 	servePlaylist(w, r, renderMedia(snap, rend, d.skip))
+}
+
+// closedRoom answers a timeline closed between its lookup and its observation, which is a room
+// without an active run, and reports whether it did.
+func closedRoom(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, ErrTimelineClosed) {
+		return false
+	}
+	http.Error(w, "the room has no active run", http.StatusServiceUnavailable)
+	return true
 }
 
 func servePlaylist(w http.ResponseWriter, r *http.Request, body []byte) {

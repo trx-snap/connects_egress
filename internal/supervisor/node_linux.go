@@ -11,6 +11,12 @@ package supervisor
 // playlists from it. A verified worker terminal ends the run, a worker gone without one fails
 // it, a stop request stops it; a run is retired in one order, playlists first, then the
 // journal, the timeline, the socket, the terminal record, and the room is freed last, once
+// that record is durable and the unit is gone. A run that ends cleanly, on a verified terminal,
+// keeps serving its final playlist, ended with EXT-X-ENDLIST, and the media it references for a
+// bounded grace after the end, so that a player reading it stops rather than retries; a newer
+// run reserved for the room supersedes it for good the moment it is reserved, whatever becomes
+// of that newer run, and a run that fails serves nothing. The
+// room is freed as described, once
 // that record is durable and the unit is gone, so a later run for the room is a new run with
 // new media, no cleanup can touch it and no worker of the old run is alive beside its own. A
 // run that is over owes its unit a stop until the stop is taken or the unit is gone, and the
@@ -182,6 +188,10 @@ const (
 	unitWatchRetry = 2 * time.Second  // between attempts to watch a unit systemd could not report on
 	recoverBudget  = 20 * time.Second // one run's recovery at startup
 
+	// finalPlaylistGrace is how long a run that ended cleanly keeps serving its final playlist
+	// and the media it references: three of a player's two-second polls.
+	finalPlaylistGrace = 6 * time.Second
+
 	runFile      = "run.json"
 	runFormat    = 2 // format 1 lacked the reserved epoch; such a record is refused, never guessed at
 	maxRunRecord = 16 * 1024
@@ -308,13 +318,14 @@ type Node struct {
 	notifier *systemd.Notifier
 	ctrl     *PlaybackController
 
-	mu        sync.Mutex
+	mu        sync.Mutex      // may be held while a run's mu is taken (Start superseding a final run); never the reverse
 	ctx       context.Context // the Run lifetime; nil before Run
 	ready     chan struct{}   // closed once Run has recovered the previous incarnation's runs
 	readyOnce sync.Once
 	closed    bool
 	runs      map[string]*run // every run known, by run id
 	rooms     map[string]*run // room id to its run that has not been retired
+	final     map[string]*run // room id to its run that ended cleanly and still serves its final playlist
 	wg        sync.WaitGroup
 }
 
@@ -348,7 +359,7 @@ func NewNode(o NodeOptions, n *systemd.Notifier) (*Node, error) {
 	if err := os.MkdirAll(o.SocketDir, 0o750); err != nil {
 		return nil, fmt.Errorf("%w: socket directory: %v", ErrInvalidOptions, err)
 	}
-	node := &Node{o: o, log: o.Log, notifier: n, ready: make(chan struct{}), runs: map[string]*run{}, rooms: map[string]*run{}}
+	node := &Node{o: o, log: o.Log, notifier: n, ready: make(chan struct{}), runs: map[string]*run{}, rooms: map[string]*run{}, final: map[string]*run{}}
 	ctrl, err := NewPlaybackController(node.resolve, nil)
 	if err != nil {
 		return nil, err
@@ -514,8 +525,25 @@ func (n *Node) Start(ctx context.Context, spec RunSpec) (RunStatus, bool, error)
 	}
 	r := &run{n: n, spec: spec, socket: socket, state: RunStarting, created: time.Now(), ready: make(chan struct{}), retiredCh: make(chan struct{})}
 	n.runs[spec.RunID], n.rooms[spec.RoomID] = r, r
+	// The room's final run, if one still serves its final playlist, is superseded by this
+	// reservation for good: whatever becomes of this run, the room never shows the older one.
+	// The mark is made before mu is released, so no lookup or media resolution that starts
+	// after the reservation selects the older run; one that already selected it finishes. Its
+	// timeline is closed once mu is released.
+	final := n.final[spec.RoomID]
+	var finalTL *Timeline
+	if final != nil {
+		delete(n.final, spec.RoomID)
+		finalTL = final.markSuperseded()
+	}
 	lifetime := n.ctx
 	n.mu.Unlock()
+	if final != nil {
+		if finalTL != nil {
+			finalTL.Close()
+		}
+		n.log.Printf("run %q room %q: final playlist withdrawn: a newer run was reserved for the room", final.spec.RunID, final.spec.RoomID)
+	}
 
 	launchCtx, cancel := context.WithTimeout(lifetime, launchBudget)
 	err := r.launch(launchCtx)
@@ -598,22 +626,29 @@ func (n *Node) lookupRun(runID string) (*run, error) {
 	return r, nil
 }
 
-// Lookup implements RoomIndex: the timeline of the room's running run. A request during the
-// recovery at startup waits for it.
+// Lookup implements RoomIndex: the timeline of the room's running run, or, while no run owns the
+// room and no newer run was reserved for it, the final timeline of its run that ended cleanly
+// within the last finalPlaylistGrace. A request during the recovery at startup waits for it.
 func (n *Node) Lookup(room string) (*Timeline, bool) {
 	<-n.ready
 	n.mu.Lock()
 	r := n.rooms[room]
+	if r == nil {
+		r = n.final[room]
+	}
 	n.mu.Unlock()
 	if r == nil {
 		return nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.state != RunRunning {
-		return nil, false
+	switch {
+	case r.state == RunRunning:
+		return r.tl, true
+	case !r.superseded && r.tl != nil && !r.tlClosed && !r.finalUntil.IsZero() && time.Now().Before(r.finalUntil):
+		return r.tl, true // the final playlist of a run that ended cleanly
 	}
-	return r.tl, true
+	return nil, false
 }
 
 // Inactive implements RoomIndex: a room any run of this node has served or is about to.
@@ -637,9 +672,9 @@ func (n *Node) resolve(key EpochKey) (*Source, error) {
 	n.mu.Unlock()
 	if r != nil {
 		r.mu.Lock()
-		ep := r.ep
+		ep, superseded := r.ep, r.superseded
 		r.mu.Unlock()
-		if ep != nil && ep.key == key && !ep.closed.Load() {
+		if ep != nil && ep.key == key && !ep.closed.Load() && !superseded {
 			return ep.src, nil
 		}
 	}
@@ -648,7 +683,8 @@ func (n *Node) resolve(key EpochKey) (*Source, error) {
 
 // maintain rolls every open epoch's retention on a fixed cadence, retries the retirement of
 // runs whose terminal record could not be written and the stop of a unit a run still owes one,
-// and releases the epochs of retired runs, asking again for a descriptor removal the store
+// withdraws the final playlist of a run that ended cleanly once its grace is over, and releases
+// the epochs of retired runs, after that grace, asking again for a descriptor removal the store
 // could not be asked for. A stop is retried in a goroutine of its own, so a systemd that does
 // not answer never stalls the maintenance of other runs, and only while the run owes it: the
 // unit of a run that is not over is never stopped from here.
@@ -673,9 +709,24 @@ func (n *Node) maintain(ctx context.Context) {
 			if stop {
 				r.stopBusy = true
 			}
+			graceOver := !r.finalUntil.IsZero() && !wall.Before(r.finalUntil)
+			withdraw := graceOver && r.tl != nil && !r.tlClosed
+			if withdraw {
+				r.tlClosed = true
+			}
+			done = done && (r.finalUntil.IsZero() || graceOver) // the media stays through the grace
 			r.mu.Unlock()
 			if pending {
 				r.complete()
+			}
+			if withdraw {
+				r.tl.Close()
+				n.mu.Lock()
+				if n.final[r.spec.RoomID] == r {
+					delete(n.final, r.spec.RoomID)
+				}
+				n.mu.Unlock()
+				n.log.Printf("run %q room %q: final playlist withdrawn after %v", r.spec.RunID, r.spec.RoomID, finalPlaylistGrace)
 			}
 			if stop {
 				n.wg.Add(1)
@@ -1102,6 +1153,7 @@ type run struct {
 	recordDir string
 	ln        *net.UnixListener
 	tl        *Timeline
+	tlClosed  bool // the timeline is closed; under mu
 	unit      WorkerUnit
 	ready     chan struct{} // closed once the launch has succeeded, been held or been rolled back
 	launchErr error         // set before ready closes on a rollback
@@ -1131,6 +1183,8 @@ type run struct {
 	stopErrText string // the last refusal of the owed stop logged
 	released    bool   // the source is closed and every removal of its descriptors has been sent
 	lnClosed    bool
+	finalUntil  time.Time // the final playlist of a clean end is served until then; zero otherwise
+	superseded  bool      // a newer run was reserved for the room: nothing of this run is served again
 }
 
 // await waits for the run's launch to settle and returns it: the launch error of a rolled-back
@@ -1672,18 +1726,25 @@ func (r *run) clearOwedStop() {
 	}
 }
 
-// retire runs once, after the run entered state, in a fixed order: the playlists are taken down,
-// the journal records the end or the failure, the timeline and the socket are closed, the
-// terminal state is made durable in the record (complete), and only then, and once the unit is
-// gone, is the room freed for a later run (freeRoom). The epoch stays open for the worker's
-// last publications until it is released after the unit is gone.
+// retire runs once, after the run entered state, in a fixed order: the playlists are taken out
+// of the controller, the journal records the end or the failure, the timeline and the socket
+// are closed, the terminal state is made durable in the record (complete), and only then, and
+// once the unit is gone, is the room freed for a later run (freeRoom). A room the verified
+// terminal ends cleanly is not closed here: its final playlist, ended, stays served through
+// Lookup for finalPlaylistGrace, and maintain closes it then. The epoch stays open for the
+// worker's last publications, and through that grace, until it is released after the unit is
+// gone.
 func (r *run) retire(state RunState, verified bool, reason string, ep *epochState) {
 	n := r.n
 	r.unexpose()
 	if r.tl != nil {
+		clean := false
 		switch {
 		case verified:
-			if err := r.tl.End(); err != nil && !errors.Is(err, ErrTimelineInvalid) {
+			switch err := r.tl.End(); {
+			case err == nil:
+				clean = true
+			case !errors.Is(err, ErrTimelineInvalid):
 				n.log.Printf("run %q: end room: %v", r.spec.RunID, err)
 			}
 		case ep != nil:
@@ -1691,7 +1752,20 @@ func (r *run) retire(state RunState, verified bool, reason string, ep *epochStat
 				n.log.Printf("run %q: fail source: %v", r.spec.RunID, err)
 			}
 		}
-		r.tl.Close()
+		if clean {
+			r.mu.Lock()
+			r.finalUntil = time.Now().Add(finalPlaylistGrace)
+			r.mu.Unlock()
+			n.mu.Lock()
+			n.final[r.spec.RoomID] = r
+			n.mu.Unlock()
+			n.log.Printf("run %q room %q: %s: final playlist served for %v", r.spec.RunID, r.spec.RoomID, state, finalPlaylistGrace)
+		} else {
+			r.mu.Lock()
+			r.tlClosed = true
+			r.mu.Unlock()
+			r.tl.Close()
+		}
 	}
 	r.closeListener()
 	r.complete()
@@ -1746,6 +1820,27 @@ func (r *run) freeRoom() {
 	n.mu.Unlock()
 	close(r.retiredCh)
 	n.log.Printf("run %q room %q: retired: record durable and unit gone; the room is free", r.spec.RunID, r.spec.RoomID)
+}
+
+// markSuperseded marks the run superseded because a newer run was reserved for its room: its
+// final-playlist grace is over, nothing of it is looked up or resolved again, and its epoch is
+// released by maintain as soon as the run is retired, under the ordering every release follows.
+// Start calls it with n.mu held, so the mark is part of the reservation; only the run's own mu
+// is taken here, nothing blocking is done, and the timeline returned, when the run still had
+// one open, is closed by the caller once n.mu is released. The newer run's timeline and epoch
+// are its own and untouched. Safe to repeat: nil the second time.
+func (r *run) markSuperseded() *Timeline {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.superseded {
+		return nil
+	}
+	r.superseded, r.finalUntil = true, time.Time{}
+	if r.tl == nil || r.tlClosed {
+		return nil
+	}
+	r.tlClosed = true
+	return r.tl
 }
 
 // release closes the epoch's source and asks the store to drop its descriptors, once each: the
