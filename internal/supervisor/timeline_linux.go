@@ -1027,9 +1027,6 @@ func (t *Timeline) repin() error {
 	for _, g := range t.st.Grace {
 		pin(g.Generation, g.SourceMSN)
 	}
-	if live := t.st.live(); live != nil && !live.Frozen() {
-		pin(live.Generation, live.StartMSN)
-	}
 	if p := t.st.Pending; p != nil {
 		b := p.Incoming
 		for i := 0; i < RoomTracks; i++ {

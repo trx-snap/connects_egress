@@ -468,3 +468,62 @@ func TestTimelineBindObserveAndRecover(t *testing.T) {
 		}
 	}
 }
+
+// TestRepinAdvancesLiveWindowRetentionFloor checks that an unfrozen live binding does not pin its
+// StartMSN once that segment has rolled out of the room window: only window segments, grace
+// references and a pending switch's start media hold Source bytes.
+func TestRepinAdvancesLiveWindowRetentionFloor(t *testing.T) {
+	newSrc := func() *Source {
+		return &Source{cfg: ipc.Config{Tracks: ipc.TracksSolo}, pins: map[*RetentionPin]map[int]int{}}
+	}
+	wantFloors := func(step string, src *Source, want int) {
+		t.Helper()
+		for trk := 0; trk < ipc.TracksSolo; trk++ {
+			if got := src.floor(trk); got != want {
+				t.Errorf("%s: track %d floor = %d, want %d", step, trk, got, want)
+			}
+		}
+	}
+
+	src := newSrc()
+	live := RoomBinding{Generation: 1, AudioTrack: ipc.TrackAudioA, StartMSN: 1, FirstRoomMSN: 1}
+	tl := &Timeline{
+		st: roomState{
+			Bindings: []RoomBinding{live},
+			Segments: []segState{
+				{RoomMSN: 7, Generation: 1, SourceMSN: 7},
+				{RoomMSN: 8, Generation: 1, SourceMSN: 8},
+			},
+		},
+		gens: map[uint64]*genRuntime{1: {src: src, segs: map[uint64]RoomSegment{}}},
+	}
+	if err := tl.repin(); err != nil {
+		t.Fatalf("repin (window only): %v", err)
+	}
+	wantFloors("window only", src, 7)
+
+	// A grace reference below the window still lowers the floor.
+	tl.st.Grace = []graceRef{{Generation: 1, Key: live.Key, SourceMSN: 5, ReleaseMonoNS: 1}}
+	if err := tl.repin(); err != nil {
+		t.Fatalf("repin (grace): %v", err)
+	}
+	wantFloors("grace", src, 5)
+
+	// A pending switch pins the incoming generation at its StartMSN without touching the live one.
+	src2 := newSrc()
+	incoming := RoomBinding{Generation: 2, AudioTrack: ipc.TrackAudioA, StartMSN: 3}
+	tl.st.Pending = &PendingSwitch{Incoming: incoming}
+	tl.gens[2] = &genRuntime{src: src2, segs: map[uint64]RoomSegment{}}
+	if err := tl.repin(); err != nil {
+		t.Fatalf("repin (pending): %v", err)
+	}
+	wantFloors("pending incoming", src2, 3)
+	wantFloors("live with pending", src, 5)
+
+	// Once grace is released the live floor advances to the window again.
+	tl.st.Grace = nil
+	if err := tl.repin(); err != nil {
+		t.Fatalf("repin (grace released): %v", err)
+	}
+	wantFloors("grace released", src, 7)
+}
