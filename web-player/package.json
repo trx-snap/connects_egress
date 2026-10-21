@@ -1,0 +1,20 @@
+{
+  "name": "connects-egress-web-player",
+  "version": "1.0.0",
+  "description": "Ultra low-latency (<2s) LL-HLS Web Player for Connects Egress",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "go": "go run server.go"
+  },
+  "keywords": [
+    "ll-hls",
+    "connects-egress",
+    "hls.js",
+    "low-latency",
+    "cmaf",
+    "video-player"
+  ],
+  "author": "Connects Egress Team",
+  "license": "UNLICENSED"
+}

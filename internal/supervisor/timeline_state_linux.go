@@ -78,6 +78,7 @@ type segState struct {
 	Generation    uint64 `json:"generation"`
 	SourceMSN     int    `json:"source_msn"`
 	Discontinuity bool   `json:"discontinuity"`
+	StartUTCNS    *int64 `json:"start_utc_ns,omitempty"`
 }
 
 // graceRef keeps the bytes of a segment removed from the head referenced until ReleaseMonoNS of
@@ -121,6 +122,14 @@ type windowRecord struct {
 	RemoveGenerations []uint64   `json:"remove_generations"`
 }
 
+func copyInt64Ptr(p *int64) *int64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
 // live returns the live generation: the last binding, or nil.
 func (st *roomState) live() *RoomBinding {
 	if len(st.Bindings) == 0 {
@@ -161,14 +170,31 @@ func (st *roomState) apply(rec roomRecord) error {
 		case rec.Bind.Generation < st.NextGeneration:
 			return fmt.Errorf("%w: bind record %d", ErrTimelineInvalid, rec.Seq)
 		}
-		st.Bindings = append(st.Bindings, *rec.Bind)
+		b := *rec.Bind
+		b.StartUTCNS = copyInt64Ptr(b.StartUTCNS)
+		st.Bindings = append(st.Bindings, b)
 		st.NextGeneration = rec.Bind.Generation + 1
 		st.Pending = nil
 	case opAdvance:
-		if rec.Advance == nil || rec.Advance.RoomMSN != st.LastAdvance+1 || st.binding(rec.Advance.Generation) == nil {
+		b := (*RoomBinding)(nil)
+		if rec.Advance != nil {
+			b = st.binding(rec.Advance.Generation)
+		}
+		if rec.Advance == nil || rec.Advance.RoomMSN != st.LastAdvance+1 || b == nil {
 			return fmt.Errorf("%w: advance record %d", ErrTimelineInvalid, rec.Seq)
 		}
-		st.Segments = append(st.Segments, *rec.Advance)
+		if rec.Advance.StartUTCNS != nil {
+			if rec.Advance.SourceMSN != b.StartMSN {
+				return fmt.Errorf("%w: advance record %d sets start utc on segment %d, want %d", ErrTimelineInvalid, rec.Seq, rec.Advance.SourceMSN, b.StartMSN)
+			}
+			if b.StartUTCNS != nil && *b.StartUTCNS != *rec.Advance.StartUTCNS {
+				return fmt.Errorf("%w: advance record %d changes start utc of generation %d", ErrTimelineInvalid, rec.Seq, b.Generation)
+			}
+			b.StartUTCNS = copyInt64Ptr(rec.Advance.StartUTCNS)
+		}
+		adv := *rec.Advance
+		adv.StartUTCNS = copyInt64Ptr(adv.StartUTCNS)
+		st.Segments = append(st.Segments, adv)
 		st.LastAdvance = rec.Advance.RoomMSN
 	case opRequest:
 		if rec.Request == nil || st.Pending != nil || rec.Request.Incoming.Generation < st.NextGeneration {

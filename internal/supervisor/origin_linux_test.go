@@ -117,6 +117,28 @@ func otContains(t *testing.T, body, want string) {
 	}
 }
 
+// otAttrSeconds returns the decimal-seconds value of attribute attr on the tag line of body, so
+// PART-HOLD-BACK=1.002 on #EXT-X-SERVER-CONTROL is 1.002s. Fails when the tag or attribute is absent.
+func otAttrSeconds(t *testing.T, body, tag, attr string) time.Duration {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, tag+":") {
+			continue
+		}
+		for _, kv := range strings.Split(strings.TrimPrefix(line, tag+":"), ",") {
+			if v, ok := strings.CutPrefix(kv, attr+"="); ok {
+				d, err := time.ParseDuration(v + "s")
+				if err != nil {
+					t.Fatalf("%s %s=%q: %v", tag, attr, v, err)
+				}
+				return d
+			}
+		}
+	}
+	t.Fatalf("playlist lacks %s %s:\n%s", tag, attr, body)
+	return 0
+}
+
 // otController returns a controller over rig's resolver with a fixed clock, and its origin.
 func otController(t *testing.T, rig *switchTestRig, tl *Timeline) (*PlaybackController, *Origin) {
 	t.Helper()
@@ -167,8 +189,8 @@ func TestOriginMasterAndRenditionPlaylists(t *testing.T) {
 	v := otOutBase + "vhi/"
 	wantVHi := strings.Join([]string{
 		"#EXTM3U", "#EXT-X-VERSION:9", "#EXT-X-TARGETDURATION:2",
-		"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.0,CAN-SKIP-UNTIL=12.0",
-		"#EXT-X-PART-INF:PART-TARGET=0.334", "#EXT-X-MEDIA-SEQUENCE:1", "#EXT-X-DISCONTINUITY-SEQUENCE:0",
+		"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=6.0,PART-HOLD-BACK=1.002,CAN-SKIP-UNTIL=12.0",
+		"#EXT-X-PART-INF:PART-TARGET=0.334", "#EXT-X-START:TIME-OFFSET=-1.2,PRECISE=YES", "#EXT-X-MEDIA-SEQUENCE:1", "#EXT-X-DISCONTINUITY-SEQUENCE:0",
 		`#EXT-X-DATERANGE:ID="atlas-1",` + otAtlasClass + `,START-DATE="2023-11-14T22:13:20.000Z",X-MODE="1v1",X-ATLAS-VERSION="1",` + otAtlas1v1,
 		`#EXT-X-MAP:URI="` + v + `init.mp4"`,
 		"#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.000Z",
@@ -212,6 +234,16 @@ func TestOriginMasterAndRenditionPlaylists(t *testing.T) {
 	}
 	// Video bytes are shared: both rooms name the same objects.
 	otContains(t, otGet(t, o, "/live/room_a/vhi.m3u8", http.StatusOK).Body.String(), `URI="`+v+`1.0.m4s"`)
+
+	// Apple's HLS authoring specification: PART-HOLD-BACK is at least three times PART-TARGET.
+	for _, r := range renditions {
+		body := otGet(t, o, "/live/room_b/"+r.name+".m3u8", http.StatusOK).Body.String()
+		holdBack := otAttrSeconds(t, body, "#EXT-X-SERVER-CONTROL", "PART-HOLD-BACK")
+		partTarget := otAttrSeconds(t, body, "#EXT-X-PART-INF", "PART-TARGET")
+		if holdBack < 3*partTarget {
+			t.Fatalf("%s: PART-HOLD-BACK %v < 3 * PART-TARGET %v", r.name, holdBack, partTarget)
+		}
+	}
 
 	// Routing and validation.
 	for _, bad := range []struct {
@@ -360,7 +392,7 @@ func TestOriginMediaBytesAcrossSwitch(t *testing.T) {
 	// Withheld beyond the cut but published: immutable bytes stay servable. Unpublished and open: 404.
 	check(otOutBase+"vhi/2.0.m4s", "video/mp4", part(0), sum(part(0)))
 	otGet(t, o, otInBase+"vhi/2.m4s", http.StatusNotFound)
-	otGet(t, o, otInBase+"vhi/2.1.m4s", http.StatusNotFound)
+	otGet(t, o, otInBase+"vhi/2.1.m4s", http.StatusServiceUnavailable)
 	otGet(t, o, otInBase+"vhi/3.m4s", http.StatusNotFound)
 	otGet(t, o, otOutBase+"vhi/3.0.m4s", http.StatusNotFound)
 

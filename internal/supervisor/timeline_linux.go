@@ -186,7 +186,36 @@ func (t *Timeline) recover() error {
 			t.rebuildFrozen(b)
 		}
 	}
-	return t.exposeLive()
+	if err := t.exposeLive(); err != nil {
+		return err
+	}
+	var migrated bool
+	for i := range t.st.Bindings {
+		b := &t.st.Bindings[i]
+		if b.StartUTCNS != nil {
+			continue
+		}
+		snap, ok := t.snapshotOf(b.Generation)
+		if !ok {
+			continue
+		}
+		if utc, ok := startUTCOf(b, snap); ok {
+			b.StartUTCNS = &utc
+			for j := range t.st.Segments {
+				if s := &t.st.Segments[j]; s.Generation == b.Generation && s.SourceMSN == b.StartMSN {
+					u := utc
+					s.StartUTCNS = &u
+				}
+			}
+			migrated = true
+		}
+	}
+	if migrated {
+		if err := t.j.rewrite(t.st); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // resolve asks the resolver for b's epoch and verifies that it is exactly the epoch b was bound
@@ -236,6 +265,11 @@ func (t *Timeline) Bind(key EpochKey, startMSN int) error {
 	}
 	b.Inits, b.FirstRoomMSN, b.Discontinuity = inits, t.st.LastAdvance+1, t.st.LastAdvance > 0
 	t.gens[b.Generation] = &genRuntime{src: src, segs: map[uint64]RoomSegment{}}
+	if snap, ok := t.snapshotOf(b.Generation); ok {
+		if utc, ok := startUTCOf(&b, snap); ok {
+			b.StartUTCNS = &utc
+		}
+	}
 	if err := t.commit(roomRecord{Op: opBind, Bind: &b}); err != nil {
 		delete(t.gens, b.Generation)
 		return err
@@ -629,12 +663,34 @@ func (t *Timeline) exposeLive() error {
 		if !ready {
 			return nil
 		}
+		if next == b.StartMSN {
+			utc := seg.Tracks[ipc.TrackVideoHi].UTCNS
+			cand.StartUTCNS = &utc
+		}
 		if err := t.commit(roomRecord{Op: opAdvance, Advance: &cand}); err != nil {
 			return err
 		}
 		rt.segs[cand.RoomMSN] = seg
 		next++
 	}
+}
+
+// startUTCOf returns the presentation UTC of the aligned IDR first part of b's start video
+// segment when that part is present in snap.
+func startUTCOf(b *RoomBinding, snap partstore.RingSnapshot) (int64, bool) {
+	ss := findSegment(snap, ipc.TrackVideoHi, b.StartMSN)
+	if ss == nil || len(ss.Parts) == 0 {
+		return 0, false
+	}
+	p0 := ss.Parts[0]
+	if p0.Index != 0 || !p0.FragmentStart || !p0.Independent {
+		return 0, false
+	}
+	utc, err := ipc.PresentationUTC(b.Presentation, ipc.TrackVideoHi, p0.PTS)
+	if err != nil || utc > math.MaxInt64-p0.Duration {
+		return 0, false
+	}
+	return utc, true
 }
 
 // build computes the exposed prefix of room segment s of b from snap. ready is false when the
@@ -849,7 +905,7 @@ func (t *Timeline) switching(now int64, timed bool) error {
 	if p.HoldStartMonoNS == 0 {
 		return nil
 	}
-	ready, inits, err := t.incomingReady(p)
+	ready, inits, startUTC, err := t.incomingReady(p)
 	if err != nil {
 		return t.cancelPending()
 	}
@@ -861,7 +917,7 @@ func (t *Timeline) switching(now int64, timed bool) error {
 			}
 		}
 		b := p.Incoming
-		b.Inits, b.FirstRoomMSN, b.Discontinuity = inits, t.st.LastAdvance+1, true
+		b.Inits, b.StartUTCNS, b.FirstRoomMSN, b.Discontinuity = inits, &startUTC, t.st.LastAdvance+1, true
 		if err := t.commit(roomRecord{Op: opBind, Bind: &b}); err != nil {
 			return err
 		}
@@ -876,38 +932,38 @@ func (t *Timeline) switching(now int64, timed bool) error {
 // incomingReady reports whether the incoming generation can start: inits for every room track, an
 // aligned independent first video part and a first audio part of its start segment, and no
 // per-track UTC overlap with the outgoing generation's exposed ends.
-func (t *Timeline) incomingReady(p *PendingSwitch) (bool, []ipc.Entry, error) {
+func (t *Timeline) incomingReady(p *PendingSwitch) (bool, []ipc.Entry, int64, error) {
 	b := p.Incoming
 	snap, ok := t.snapshotOf(b.Generation)
 	if !ok {
-		return false, nil, nil
+		return false, nil, 0, nil
 	}
 	if snap.Terminal != nil && !snap.Terminal.Verified {
-		return false, nil, fmt.Errorf("incoming source failed")
+		return false, nil, 0, fmt.Errorf("incoming source failed")
 	}
 	inits := make([]ipc.Entry, RoomTracks)
 	for i := range inits {
 		trk := b.SourceTrack(i)
 		if trk >= len(snap.Tracks) || snap.Tracks[trk].Init == nil {
-			return false, nil, nil
+			return false, nil, 0, nil
 		}
 		inits[i] = *snap.Tracks[trk].Init
 	}
 	seg, ready, err := t.build(&b, snap, segState{SourceMSN: b.StartMSN}, nil)
 	if err != nil {
-		return false, nil, err
+		return false, nil, 0, err
 	}
 	if !ready {
-		return false, nil, nil
+		return false, nil, 0, nil
 	}
 	if out := t.st.live(); out != nil {
 		for i, end := range t.ends(out) {
 			if end.ref.MSN != 0 && seg.Tracks[i].UTCNS < end.utc {
-				return false, nil, fmt.Errorf("incoming room track %d starts at %d before outgoing end %d", i, seg.Tracks[i].UTCNS, end.utc)
+				return false, nil, 0, fmt.Errorf("incoming room track %d starts at %d before outgoing end %d", i, seg.Tracks[i].UTCNS, end.utc)
 			}
 		}
 	}
-	return true, inits, nil
+	return true, inits, seg.Tracks[ipc.TrackVideoHi].UTCNS, nil
 }
 
 // roll removes head segments the window no longer needs, keeping their bytes referenced for the
@@ -1060,12 +1116,17 @@ func (t *Timeline) repin() error {
 func (t *Timeline) publish() {
 	v := TimelineSnapshot{Room: t.opts.Room, Bindings: slices.Clone(t.st.Bindings), DSN: t.st.DSN,
 		NextMSN: t.st.LastAdvance + 1, Ended: t.st.Ended, Refusing: t.poison != nil, Closed: t.closed}
+	for i := range v.Bindings {
+		v.Bindings[i].StartUTCNS = copyInt64Ptr(v.Bindings[i].StartUTCNS)
+	}
 	if live := t.st.live(); live != nil {
 		l := *live
+		l.StartUTCNS = copyInt64Ptr(l.StartUTCNS)
 		v.Live, v.Failed, v.FailReason = &l, live.Failed, live.FailReason
 	}
 	if p := t.st.Pending; p != nil {
 		c := *p
+		c.Incoming.StartUTCNS = copyInt64Ptr(c.Incoming.StartUTCNS)
 		v.Pending = &c
 	}
 	for _, s := range t.st.Segments {
@@ -1085,16 +1146,19 @@ func (t *Timeline) copyView() TimelineSnapshot {
 	v := t.view
 	v.Bindings = slices.Clone(v.Bindings)
 	for i := range v.Bindings {
+		v.Bindings[i].StartUTCNS = copyInt64Ptr(v.Bindings[i].StartUTCNS)
 		v.Bindings[i].Inits = slices.Clone(v.Bindings[i].Inits)
 		v.Bindings[i].Ends = slices.Clone(v.Bindings[i].Ends)
 	}
 	if v.Live != nil {
 		l := *v.Live
+		l.StartUTCNS = copyInt64Ptr(l.StartUTCNS)
 		l.Inits, l.Ends = slices.Clone(l.Inits), slices.Clone(l.Ends)
 		v.Live = &l
 	}
 	if v.Pending != nil {
 		p := *v.Pending
+		p.Incoming.StartUTCNS = copyInt64Ptr(p.Incoming.StartUTCNS)
 		v.Pending = &p
 	}
 	v.Segments = slices.Clone(v.Segments)

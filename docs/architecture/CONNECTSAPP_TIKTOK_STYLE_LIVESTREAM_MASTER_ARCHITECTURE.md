@@ -17,9 +17,10 @@ This document defines the production architecture for **ConnectsApp Livestreamin
 ### Core Architecture Principles
 
 1. **Strictly Two-Tier Delivery:** WebRTC is strictly reserved for the broadcaster, co-host, PK battle opponent, and host-approved multi-guests (<10 active publishers). Mass spectators never connect to WebRTC; they consume cost-effective HLS/LL-HLS streams.
-2. **Two-Server Launch Topology (Product Owner Decision D1):**
-   * **Node 1: Frankfurt (Hetzner Dedicated Server, 10G NIC):** Master Media Origin, EU/US/Central Asia/MidEast Ingress, Unified Packager (`connects-egress`), RAM-Disk Origin Shield.
-   * **Node 2: Singapore (Hetzner Cloud CCX / Dedicated Edge):** Asia-Pacific & Oceania Ingress/Edge, Southeast Asia / Bangladesh / Australia / NZ Spectator Delivery, Local Packager & Edge Cache.
+2. **Two-Server Launch Topology & Launch Budget Target (Product Owner Decision D1):**
+   * **Launch Candidate Assumption (< €300/mo):** The initial deployment validates a budget-conscious two-server topology targeting under €300/month (planning assumption based on dated source prices, subject to current quote and traffic validation), evaluated using Hetzner Frankfurt dedicated bare metal and Hetzner Singapore Cloud. This provider and cost profile is an assumption to validate in Phase 0 / launch trials, not a permanent architectural lock or product constraint.
+   * **Node 1: Frankfurt (Master Origin, 10G NIC):** Master Media Origin, EU/US/Central Asia/MidEast Ingress, Unified Packager (`connects-egress`), RAM-Disk Origin Shield (initial launch candidate: Hetzner Dedicated AX102).
+   * **Node 2: Singapore (East Edge / Ingress):** Asia-Pacific & Oceania Ingress/Edge, Southeast Asia / Bangladesh / Australia / NZ Spectator Delivery, Local Packager & Edge Cache (initial launch candidate: Hetzner Cloud CCX).
    * **Future Infrastructure Separation (D2):** Bunny.net Karachi, Gcore Tashkent/Almaty, Sydney, North America, and in-country regional data centres are explicitly deferred to the *Future Regional Infrastructure* roadmap.
 3. **Unified Single-Binary Media Engine (`connects-egress`, plan v2.3.0):**
    * Replaces LiveKit Egress + RTMP loopback + OvenMediaEngine with **one Go binary running three isolated process roles**: `supervisor` (pure Go: Part Store, Room Playback Timelines, LL-HLS origin), `worker` (one per source: ingest, compose, one ABR ladder, per-room audio) and `bridge` (cross-node / cross-region host relay).
@@ -31,7 +32,7 @@ This document defines the production architecture for **ConnectsApp Livestreamin
    * **Mode 3 (Tryon, three-way free-for-all):** atlas 720×656 (same 2×2 as Quadro: 3× 360×328 host tiles + 1 black cell); each audience sees own host top-left, opponents in the right column and the empty cell bottom-left (covered by a Flutter panel).
    * **Mode 4 (Quadro 2v2):** atlas 720×656 (4× 360×328); each audience sees its own team in the left column.
    * **Decision D-B:** the `bridge` relays host media between LiveKit nodes and regions (self-hosted LiveKit pins each room to one node), so battles work across servers and countries without hosts reconnecting.
-5. **Vendor-Neutral Edge/Region Routing Contract (D3):** Software is architected so new regional edges, CDNs, or private data centres are registered and routed via backend configuration APIs without requiring client mobile app updates.
+5. **Vendor-Neutral Architecture & Hardware Portability (D3):** Software is architected so new regional edges, CDNs, or private data centres are registered and routed via backend configuration APIs without requiring client mobile app updates. Portability across Linux amd64 and arm64 architectures is an explicit design and validation target (cross-platform reliability is not assumed proven); hardware acceleration (e.g. VAAPI, NVENC) is capability-probed and optional, with CPU software x264 encoding serving as the initial baseline and fallback (with x265 deferred for future evaluation) when required GStreamer plugins are available (runtime package availability and performance must be validated per target; not all distributions include these plugins). Capacity is treated as an empirical measurement for whichever node model is deployed; switching host vendors or chip models requires recalibrating capacity (budget units), not rewriting product code.
 6. **Vanguard Dedicated Player Playback (D6):** Spectator playback is powered exclusively by the in-house **Vanguard streaming engine** (native GPU pipeline: Media3/ExoPlayer on Android, AVPlayer + CADisplayLink on iOS via `connectsapp_app/lib/app/shared/media/playback/vanguard/`), not stock Flutter `video_player`.
 7. **Fixed Resolution & Frame Rate Baseline:** Broadcaster cameras, GPU processing, and hardware encoders are locked to **true 720×1280 portrait at 30 fps** (Slice E4 contract invariant). Client-side simulcast is strictly forbidden.
 8. **On-Demand Recording Only (D7):** Livestreams are written to persistent storage **only when the creator explicitly initiates recording**. Unrecorded live streams leave zero persistent footprint beyond the in-memory rolling buffer.
@@ -59,7 +60,7 @@ The following diagram illustrates the decoupled architecture separating the Fina
                                   ▼                                   ▼
 ┌─────────────────────────────────────────────────┐ ┌─────────────────────────────────────────────┐
 │ MEDIA PLANE — NODE 1: FRANKFURT (Master Origin) │ │ MEDIA PLANE — NODE 2: SINGAPORE (East Edge) │
-│ (Hetzner Dedicated AX102 / 10G NIC)             │ │ (Hetzner Cloud CCX / Dedicated Edge)        │
+│ (Launch Candidate: Hetzner AX102 / 10G NIC)     │ │ (Launch Candidate: Hetzner Cloud CCX)       │
 │                                                 │ │                                             │
 │ [ Broadcasters (EU / MidEast / US) ]            │ │ [ Broadcasters (SEA / ANZ) ]                │
 │   │ Vanguard Ingress (720x1280 @ 30fps, 1.8M)   │ │   │ Vanguard Ingress (720x1280 @ 30fps)     │
@@ -161,7 +162,7 @@ The following locations and services are **explicitly removed from the launch to
 > **Cloudflare Video Terms & Storage Economics (Verified Source):**
 > 1. **Updated CDN Service Terms (May 2023 Update):** Cloudflare retired the historic "Section 2.8" blanket restriction. Under current terms (Section 2.2 and Service-Specific Terms), video delivery is explicitly permitted **only when using Cloudflare's designated media products (Cloudflare Stream, Cloudflare Images, Cloudflare R2)**. Routing external, unapproved high-volume video streams through standard Free/Pro/Business CDN caching violates service terms.
 > 2. **Cloudflare R2 Economics Trap:** While R2 offers zero egress fees, Class B read operations on live 333ms–500ms chunks cost **$0.36 per million operations**. At 10,000 viewers fetching 2 chunks per second, uncached live playback incurs over 72 million operations per hour (**~$26/hour or ~$780/month** for a single active room).
-> 3. **Architectural Guardrail:** Active rolling live chunks are held **strictly in the in-memory Part Store (memfd / RAM)** on Hetzner servers. Cloudflare R2 is used **strictly for completed on-demand VOD recordings, permanent highlight clips, and static UI assets**.
+> 3. **Architectural Guardrail:** Active rolling live chunks are held **strictly in the in-memory Part Store (memfd / RAM)** on origin/edge media nodes (such as the initial budget-conscious Hetzner launch candidate instances, not a permanent constraint). Cloudflare R2 is used **strictly for completed on-demand VOD recordings, permanent highlight clips, and static UI assets**.
 
 ### 3.5 Broadcaster Ingress & The Unified `connects-egress` Engine
 
@@ -173,12 +174,11 @@ Solo ladder shown below. Battle modes use the same tiers on their own geometry (
 
 | Tier | Resolution (Solo) | Frame Rate | Video Bitrate (`TARGET`, set by Gate G-C) | Audio Bitrate | Target Network / Silicon |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`hi` (H.265)** | 720 × 1280 | 30 fps | **950 kbps (HEVC)** | 128 kbps | High-speed Wi-Fi, 5G, flagship devices |
-| **`mid` (H.265)** | 576 × 1024 | 30 fps | **450 kbps (HEVC)** | 64 kbps | Standard 4G/LTE mobile networks |
-| **`lo` Data-Saver (H.265)** | 360 × 640 | 30 fps | **220 kbps (HEVC)** | 48 kbps | 3G, prepaid cellular |
-| **Web Fallback (H.264, lazy)** | 720 × 1280 | 30 fps | 1,600 kbps (x264) | 128 kbps | Started only when a non-HEVC client requests the room |
+| **`hi` (H.264)** | 720 × 1280 | 30 fps | `NOT_VERIFIED` (candidate `TARGET` ~1,600 kbps) | 128 kbps | High-speed Wi-Fi, 5G, modern devices |
+| **`mid` (H.264)** | 576 × 1024 | 30 fps | `NOT_VERIFIED` (candidate `TARGET` ~800–1,000 kbps) | 64 kbps | Standard 4G/LTE mobile networks |
+| **`lo` Data-Saver (H.264)** | 360 × 640 | 30 fps | `NOT_VERIFIED` (candidate `TARGET` ~400–500 kbps) | 48 kbps | 3G, prepaid cellular |
 
-HEVC ships as primary only after Gates G-C (quality/CPU) and G-D (hardware decode on budget Android + thermals) pass. Otherwise the same pipeline runs x264 rungs by configuration. The Android CDD requires HEVC support but not hardware decode; HEVC licensing goes through Legal Gate D8.
+H.264 is the near-term primary/shipping ladder, and `x264` software encoding is the initial baseline across targets, subject to Gate G-C calibration (quality, candidate bitrates, preset tuning, and CPU capacity) and target-environment validation. The obsolete concept of a lazy H.264 web fallback is removed; all mobile and web clients consume the single 3-tier H.264 ladder. HEVC is deferred as an optional future evaluation path, which would require passing Gate G-C (efficiency verification on real atlas content under live low-latency constraints), deferred Gate G-D (device hardware decode and 30-minute thermal qualification on low-end Android and minimum iOS devices), and Legal Gate D8 (review of patent pool and licensing terms). Prior HEVC planning targets (~950 / 450 / 220 kbps) and directional test data remain non-decisive historical references. Portability across Linux amd64 and arm64 is an architectural design and validation target: software encoding (`x264enc`, with `x265enc` deferred as an optional future backend) serves as the intended baseline and fallback when required GStreamer plugins are available (runtime package availability and performance must be validated per target distribution and architecture, without assuming all distributions include these plugins or that cross-platform reliability is already proven), avoiding discrete GPU dependency.
 
 *(Authoritative spec: [`CONNECTS_EGRESS_IMPLEMENTATION_PLAN.md`](CONNECTS_EGRESS_IMPLEMENTATION_PLAN.md) v2.3.0).*
 
@@ -338,7 +338,7 @@ Device thermal metrics are evaluated using platform-native APIs mapped to a unif
 * **Battle state:** 1v1 two-colour bar; Tryon three-colour bar; Quadro `team_red = A + C`, `team_blue = B + D` in Redis. Diamonds are always credited to the individual host in TigerBeetle. Gift/score/timer events carry `server_ts` and render when the playhead's `PROGRAM-DATE-TIME` reaches them (gifter's own echo stays instant).
 
 #### 7.2.1 Phased Implementation Roadmap
-* **Phase 0:** plan v2.3.0 §16 gates (ingest, codec/CPU, HEVC device decode, ABR alignment, LL-HLS conformance, crash continuity, bridge latency, player atlas layout, event sync).
+* **Phase 0:** plan v2.3.0 §16 gates (ingest, H.264 codec/CPU calibration, deferred HEVC device decode re-entry criteria, ABR alignment, LL-HLS conformance, crash continuity, bridge latency, player atlas layout, event sync).
 * **Phase 1:** Solo + 1v1, including same-region multi-node and cross-region bridging.
 * **Phase 2:** Tryon + Quadro — atlas geometries, perspective tables, bridge fan-out and team logic only; no new media mechanism.
 
@@ -443,29 +443,38 @@ stream {
 ### 11.1 Infrastructure Separation (Resolving P0-4)
 * **Financial & Control Plane:** TigerBeetle cluster, PostgreSQL primary/replica, and Redis cluster are hosted independently of the high-throughput media transcoding servers.
 * **No "Auto-Scaling" on Fixed Hardware:** Fixed dedicated servers have strict physical CPU ceilings. Instead of unrealistic auto-scaling claims on fixed bare metal, each server enforces a **hard admission cap expressed in measured encode budget units** (per-mode costs set by plan v2.3.0 Gate G-C; the earlier 20–25-room figure assumed x264 and one output per battle and is withdrawn) plus a spectator egress cap derived from the actual provisioned NIC. When a node reaches 85% of either budget, new sources and spectators are routed to another node, region or the Mode A CDN.
+* **Empirical Capacity Calibration per Node Model:** Server capacity is an empirical property of the deployed node model, not a hardcoded software constant. Deploying on alternative hosting providers or hardware models requires recalibrating budget units via Gate G-C, not rewriting product or pipeline code.
 
 ---
 
 ## 12. Scalability, Capacity & Cost Model
 
-### 12.1 Hetzner Infrastructure Facts & Pricing Reality (Resolving P0-5)
+### 12.1 Launch Candidate Infrastructure Baseline & Pricing Reality (Resolving P0-5)
 
-* **Hetzner Dedicated Frankfurt (AX102):**
+To establish an economically viable baseline, Hetzner Dedicated Frankfurt (AX102) and Hetzner Cloud Singapore (CCX33) are evaluated as the **budget-conscious initial launch candidate topology** (an initial candidate option, not a permanent product constraint). The estimated spend under €300/month (~€227/month baseline) represents a planning assumption based on dated source prices, subject to current quote and traffic validation.
+
+> [!NOTE]
+> **Launch Assumptions vs. Portability Design Targets:**
+> Hardware configurations, pricing terms, and quota calculations (including the < €300/month planning target and ~€227/month baseline) represent initial launch candidate assumptions based on dated source prices, subject to current quote and traffic validation during Phase 0 trials rather than an architectural guarantee or permanent product constraint. Portability across Linux (amd64 and arm64) is an explicit design and validation target, not an assumed proven state. GPU/hardware acceleration is optional and capability-probed, while software encoding (`x264enc`, with `x265enc` deferred as an optional future backend) is the intended baseline and fallback when required GStreamer plugins are available; runtime package availability and encoding performance must be validated per target distribution and architecture (not all distributions bundle these plugins, and cross-platform reliability is not assumed proven). Deploying on alternative hosting vendors or chip models requires recalibrating capacity (budget units), not rewriting product code.
+
+* **Frankfurt Dedicated Launch Candidate (Hetzner AX102):**
   * Hardware: AMD Ryzen 9 7950X3D (16 Cores / 32 Threads), 128 GB DDR5 RAM, 2x 1.92 TB NVMe Datacenter Edition.
   * Base Price: ~€114 / month + 10G NIC Add-on: ~€33 / month = **~€147 / month**.
   * **10G Uplink Traffic Terms:** Includes **20 TB outbound traffic per month**. Overage is billed at **€1.00 per TB (excluding VAT)**.
-* **Hetzner Singapore Availability:**
+* **Singapore Cloud Edge Launch Candidate (Hetzner Cloud):**
   * Dedicated root servers are NOT offered in Singapore (EU/US only).
   * In Singapore, Hetzner provides **Hetzner Cloud** (e.g. CCX33 dedicated vCPU instance: 8 vCPUs, 32 GB RAM at ~€80 / month).
 * **Broadcast Room Capacity under `connects-egress` (`NOT_VERIFIED`):**
   * Eliminating the double encode (Egress $\to$ OME) and encoding one ladder per match (D-A) lowers CPU per room, but no per-room figure is ratified.
-  * Room capacity per node is expressed in **encode budget units measured by Gate G-C** on the actual AX102 (plan §15). The earlier "~1.1–1.4 threads per room" and "20 to 25 simultaneous live rooms" figures are withdrawn.
+  * Room capacity per node is expressed in **encode budget units measured by Gate G-C** on the actual deployed node model (initially calibrated on the budget-conscious AX102 launch candidate as an initial baseline rather than a permanent product constraint; plan §15). The earlier "~1.1–1.4 threads per room" and "20 to 25 simultaneous live rooms" figures are withdrawn. Switching node models or hosting providers requires recalibrating budget units, not code modifications.
 * **Bandwidth & Viewer Limits on a 10G Port:**
   * Practical safe saturation ceiling (80%): **8,000 Mbps (8 Gbps)**.
   * Average spectator bitrate across ladder: ~1,000 kbps (1 Mbps).
   * **Maximum Concurrent Spectators on Single 10G Port = 8,000 Concurrent Viewers.** Beyond 8,000 concurrent viewers on Frankfurt, a commercial CDN (Mode A) or additional edge servers become mandatory.
 
-### 12.2 Rebuilt Monthly Cost Model (Two-Server Launch Topology)
+### 12.2 Rebuilt Monthly Cost Model (Two-Server Launch Candidate Topology)
+
+*The cost model below reflects planning assumptions for the budget-conscious initial launch candidate topology (Hetzner Frankfurt AX102 + Singapore CCX33) based on dated source prices, subject to current quote and traffic validation to evaluate the < €300/month target (~€227/month baseline) before scale (an initial launch candidate, not a permanent product constraint):*
 
 | Tier | Concurrent Viewers | Monthly Outbound Data | Frankfurt AX102 (10G Dedicated) | Singapore Cloud (CCX33 Edge) | Bandwidth Overage Cost | Total Monthly Infrastructure Cost | Commercial CDN Comparison (Cloudflare Stream) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -480,7 +489,7 @@ stream {
 
 ### 13.1 Sanctions, Hosting ToS & Jurisdiction Restrictions
 * **International Sanctions (OFAC / EU Regulations):** Providing paid financial services, in-app coin transactions, or commercial hosting in sanctioned territories (e.g. Iran) is strictly regulated.
-* **Hosting Terms Compliance:** Hetzner and cloud providers require strict adherence to EU/German export controls.
+* **Hosting Terms Compliance:** Infrastructure providers (including Hetzner for the initial launch candidate) and cloud partners require strict adherence to EU/German export controls.
 * **App Store Distribution:** Apple does not operate an App Store in Iran; Google Play billing services are unavailable.
 * **Legal Policy Invariant:** ConnectsApp does not employ "censorship bypass" or "DPI evasion" techniques. Delivery relies exclusively on standard HTTPS (port 443), compliant TLS 1.3 encryption, and server-driven IP failover.
 
@@ -518,7 +527,7 @@ Spectator video playback is owned exclusively by the Vanguard native streaming e
 
 | Proof Gate / Spike | Subsystem Under Test | Success Criteria & Verification Seam | Status |
 | :--- | :--- | :--- | :---: |
-| **Spike-1** | **`connects-egress` Phase 0 gates (Solo + 1v1 + Bridge)** | Plan v2.3.0 §16 gates G-I, G-C, G-D, G-A, G-L, G-R, G-B, G-P, G-S: ingest choice, codec/CPU budget units, HEVC device decode, aligned IDRs, LL-HLS conformance with demuxed audio and discontinuities, crash continuity ≤ 3 s, cross-region bridge ≤ 350 ms host↔host, player atlas layout on 1 decoder, HUD↔video skew ≤ 200 ms. | **`NOT_PROVEN`** |
+| **Spike-1** | **`connects-egress` Phase 0 gates (Solo + 1v1 + Bridge)** | Plan v2.3.0 §16 gates G-I, G-C, G-D (deferred), G-A, G-L, G-R, G-B, G-P, G-S: ingest choice, H.264 codec/CPU budget units, deferred HEVC device decode criteria, aligned IDRs, LL-HLS conformance with demuxed audio and discontinuities, crash continuity ≤ 3 s, cross-region bridge ≤ 350 ms host↔host, player atlas layout on 1 decoder, HUD↔video skew ≤ 200 ms. | **`NOT_PROVEN`** |
 | **Spike-2** | **Multi-Host Expansion (Tryon & Quadro)** | Add Tryon/Quadro atlas geometries, player perspective tables, hub-and-spoke bridge fan-out for 3–4 hosts and team scoring; no new media mechanism. | **`NOT_PROVEN`** |
 | **Spike-3** | **TigerBeetle Linked-Transfer Exchange Spike** | Go sidecar executing 3-leg linked transfers across Coin and Diamond ledgers under 5,000 simulated concurrent gift events with zero overdraft. | **`NOT_PROVEN`** |
 | **Gate 1** | **Vanguard LL-HLS Playback Proof** | `AppVanguardVideoPlayerView` playing live LL-HLS stream on physical Android (`SM-A566B`) and iOS device with 2–4s live latency. | **`NOT_PROVEN`** |
@@ -539,8 +548,8 @@ Spectator video playback is owned exclusively by the Vanguard native streaming e
 | **LiveKit Go Server SDK** | [github.com/livekit/server-sdk-go](https://github.com/livekit/server-sdk-go) | 2026-10-06 | "Official Go SDK for LiveKit. Allows building custom server-side participants, room bots, and media pipes." | `VERIFIED_SOURCE` |
 | **OvenMediaEngine Architecture** | [github.com/AirenSoft/OvenMediaEngine](https://github.com/AirenSoft/OvenMediaEngine) | 2026-10-06 | "Written in C++17. Relies on FFmpeg (libavcodec, libswscale) for core transcoding and packaging." | `VERIFIED_SOURCE` |
 | **TigerBeetle Same-Ledger Rule** | [tigerbeetle.com/docs/reference/operations/create_transfers](https://tigerbeetle.com/docs/reference/operations/create_transfers) | 2026-10-06 | `accounts_must_have_the_same_ledger`: "The debit and credit accounts must belong to the same ledger." Direct transfers between different ledgers are prohibited. | `VERIFIED_SOURCE` |
-| **Hetzner 10G Uplink Terms** | [hetzner.com/dedicated-rootserver/matrix-ax/](https://www.hetzner.com/dedicated-rootserver/matrix-ax/) | 2026-10-06 | Dedicated 10G port includes 20 TB monthly outbound traffic. Overage is billed at €1.00 per TB (excl. VAT). Not unmetered. | `VERIFIED_SOURCE` |
-| **Hetzner Singapore Availability** | [hetzner.com/cloud/](https://www.hetzner.com/cloud/) | 2026-10-06 | Dedicated root servers are NOT offered in Singapore (EU/US only). Singapore presence is Hetzner Cloud only (CCX/CPX) with tiered traffic. | `VERIFIED_SOURCE` |
+| **Hetzner 10G Uplink Terms (Launch Candidate)** | [hetzner.com/dedicated-rootserver/matrix-ax/](https://www.hetzner.com/dedicated-rootserver/matrix-ax/) | 2026-10-06 | Dedicated 10G port includes 20 TB monthly outbound traffic. Overage is billed at €1.00 per TB (excl. VAT). Evaluated for initial launch candidate based on dated source pricing (2026-10-06), subject to current quote and traffic validation. | `VERIFIED_SOURCE` |
+| **Hetzner Singapore Availability (Launch Candidate)** | [hetzner.com/cloud/](https://www.hetzner.com/cloud/) | 2026-10-06 | Dedicated root servers are NOT offered in Singapore (EU/US only). Singapore presence is Hetzner Cloud only (CCX/CPX) with tiered traffic. Evaluated for initial launch candidate based on dated source pricing (2026-10-06), subject to current quote validation. | `VERIFIED_SOURCE` |
 | **Cloudflare CDN Video Terms** | [cloudflare.com/terms/](https://www.cloudflare.com/terms/) | 2026-10-06 | Section 2.8 retired May 2023. Video caching on standard CDN restricted unless using Cloudflare Stream or R2. R2 Class B reads: $0.36/M. | `VERIFIED_SOURCE` |
 | **TikTok LIVE Replay Behavior** | [support.tiktok.com](https://support.tiktok.com/en/live-gifts-wallet/tiktok-live/live-recordings) | 2026-10-06 | TikTok automatically generates LIVE Replays stored in TikTok Studio for 30 days. No in-stream start/stop recording button exists. | `VERIFIED_SOURCE` |
 | **NGINX TURN Port 443 SNI Mux** | [nginx.org/en/docs/stream/ngx_stream_ssl_preread_module.html](https://nginx.org/en/docs/stream/ngx_stream_ssl_preread_module.html) | 2026-10-06 | `ssl_preread on;` extracts SNI hostname from Client Hello, allowing raw Layer 4 routing to LiveKit TURN (5349) alongside HTTPS. | `VERIFIED_SOURCE` |

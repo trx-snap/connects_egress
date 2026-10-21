@@ -21,12 +21,15 @@ import (
 const (
 	playlistMIME = "application/vnd.apple.mpegurl"
 
-	// §7.5 packaging parameters.
+	// §7.5 packaging parameters. Apple's HLS authoring specification requires PART-HOLD-BACK to
+	// be at least three times PART-TARGET: 3 × videoPartTarget, the larger part target.
 	targetDuration   = 2
 	videoPartTarget  = 334 * time.Millisecond
 	audioPartTarget  = 320 * time.Millisecond
-	partHoldBack     = "1.0"
-	canSkipUntil     = 12 * time.Second
+	holdBackAttr        = "6.0"
+	partHoldBack        = "1.002"
+	startTimeOffsetAttr = "-1.2"
+	canSkipUntil        = 12 * time.Second
 	canSkipUntilAttr = "12.0"
 
 	// atlasVersion is the initial version of the atlas DATERANGE contract (§4.5).
@@ -110,8 +113,9 @@ func renderMedia(snap TimelineSnapshot, r rendition, delta bool) []byte {
 	segs := snap.Segments
 	var b strings.Builder
 	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:%d\n", targetDuration)
-	fmt.Fprintf(&b, "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=%s,CAN-SKIP-UNTIL=%s\n", partHoldBack, canSkipUntilAttr)
+	fmt.Fprintf(&b, "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=%s,PART-HOLD-BACK=%s,CAN-SKIP-UNTIL=%s\n", holdBackAttr, partHoldBack, canSkipUntilAttr)
 	fmt.Fprintf(&b, "#EXT-X-PART-INF:PART-TARGET=%s\n", seconds(int64(r.partTarget)))
+	fmt.Fprintf(&b, "#EXT-X-START:TIME-OFFSET=%s,PRECISE=YES\n", startTimeOffsetAttr)
 	first := snap.NextMSN
 	if len(segs) > 0 {
 		first = segs[0].MSN
@@ -180,10 +184,16 @@ func bindingOf(snap TimelineSnapshot, gen uint64) *RoomBinding {
 	return nil
 }
 
-// writeAtlas writes the §4.5 atlas DATERANGE of binding bd, started at the video start of seg, the
-// generation's first segment in the window. X-SLOTS lists slot:host_id:room_id:x,y,w,h per slot,
-// separated by semicolons, identities query-escaped, rectangles normalised to 0..1 of the atlas.
+// writeAtlas writes the §4.5 atlas DATERANGE of binding bd, started at the actual first video IDR
+// segment UTC of the generation. When a legacy binding lacks StartUTCNS and its start segment has
+// already rolled out of the window, no DATERANGE is emitted rather than inventing a timestamp.
+// X-SLOTS lists slot:host_id:room_id:x,y,w,h per slot, separated by semicolons, identities
+// query-escaped, rectangles normalised to 0..1 of the atlas.
 func writeAtlas(b *strings.Builder, bd *RoomBinding, seg RoomSegment) {
+	startUTC, ok := atlasStartUTC(bd, seg)
+	if !ok {
+		return
+	}
 	pres := bd.Presentation
 	var slots []string
 	for i, s := range pres.Slots {
@@ -194,8 +204,22 @@ func writeAtlas(b *strings.Builder, bd *RoomBinding, seg RoomSegment) {
 		slots = append(slots, fmt.Sprintf("%d:%s:%s:%s", i, url.QueryEscape(s.HostID), url.QueryEscape(s.RoomID), rect))
 	}
 	fmt.Fprintf(b, "#EXT-X-DATERANGE:ID=\"atlas-%d\",CLASS=\"%s\",START-DATE=\"%s\",X-MODE=\"%s\",X-ATLAS-VERSION=\"%s\",X-SLOTS=\"%s\",X-CROP-ANCHOR=%s\n",
-		bd.Generation, atlasClass, utcString(seg.Tracks[ipc.TrackVideoHi].UTCNS), pres.Config.Mode, atlasVersion,
+		bd.Generation, atlasClass, utcString(startUTC), pres.Config.Mode, atlasVersion,
 		strings.Join(slots, ";"), strconv.FormatFloat(pres.CropAnchor, 'f', -1, 64))
+}
+
+func atlasStartUTC(bd *RoomBinding, seg RoomSegment) (int64, bool) {
+	if bd.StartUTCNS != nil {
+		return *bd.StartUTCNS, true
+	}
+	startMSN := bd.StartMSN
+	if startMSN == 0 {
+		startMSN = 1
+	}
+	if seg.SourceMSN == startMSN && len(seg.Tracks[ipc.TrackVideoHi].Parts) > 0 {
+		return seg.Tracks[ipc.TrackVideoHi].UTCNS, true
+	}
+	return 0, false
 }
 
 // skipCount returns how many leading segments a delta playlist may skip on track trk: a segment
@@ -228,6 +252,9 @@ func nextPart(snap TimelineSnapshot, trk int) (msn, idx int, base string, ok boo
 	t := last.Tracks[trk]
 	base = mediaBase(last.Key, t.Track)
 	if !t.Closed {
+		if len(t.Parts) == 0 || (trk < ipc.TrackAudioA && (len(t.Parts) >= 6 || t.Parts[len(t.Parts)-1].Index >= 5)) {
+			return 0, 0, "", false
+		}
 		return last.SourceMSN, len(t.Parts), base, true
 	}
 	if snap.Pending != nil {

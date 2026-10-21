@@ -21,6 +21,7 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -305,9 +306,14 @@ func (o *Origin) media(w http.ResponseWriter, r *http.Request, segs []string) {
 	case mediaSegment:
 		data, err = src.ReadSegment(trk, msn)
 	default:
-		data, err = src.ReadPart(trk, msn, idx)
+		data, err = o.readPart(r.Context(), key, src, trk, msn, idx)
 	}
 	switch {
+	case errors.Is(err, errClientGone):
+		return
+	case errors.Is(err, errPartTimeout):
+		http.Error(w, "the requested part did not arrive in time", http.StatusServiceUnavailable)
+		return
 	case errors.Is(err, partstore.ErrNotFound), errors.Is(err, partstore.ErrNotReady), errors.Is(err, partstore.ErrClosed):
 		http.NotFound(w, r)
 		return
@@ -322,6 +328,116 @@ func (o *Origin) media(w http.ResponseWriter, r *http.Request, segs []string) {
 	w.Header().Set("Content-Type", mime)
 	w.Header().Set("Cache-Control", mediaCacheControl)
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+}
+
+var (
+	errPartTimeout = errors.New("part timeout")
+	errClientGone  = errors.New("client gone")
+)
+
+// readPart serves a committed media part immediately, or waits up to three part targets when the
+// requested part is an active preload hint on a healthy source and live room timeline.
+func (o *Origin) readPart(ctx context.Context, key EpochKey, src *Source, trk, msn, idx int) ([]byte, error) {
+	data, err := src.ReadPart(trk, msn, idx)
+	if !errors.Is(err, partstore.ErrNotFound) {
+		return data, err
+	}
+	obs, obsErr := src.Observe()
+	if obsErr != nil {
+		return nil, obsErr
+	}
+	if data, err = src.ReadPart(trk, msn, idx); !errors.Is(err, partstore.ErrNotFound) {
+		return data, err
+	}
+	ok, tlCh0, tlCh1 := o.activePartHint(key, obs, trk, msn, idx)
+	if !ok {
+		return nil, partstore.ErrNotFound
+	}
+	target := videoPartTarget
+	if trk >= ipc.TrackAudioA {
+		target = audioPartTarget
+	}
+	timer := time.NewTimer(3 * target)
+	defer timer.Stop()
+	for {
+		select {
+		case <-obs.Changed:
+		case <-tlCh0:
+		case <-tlCh1:
+		case <-timer.C:
+			if data, err = src.ReadPart(trk, msn, idx); !errors.Is(err, partstore.ErrNotFound) {
+				return data, err
+			}
+			if obs, obsErr = src.Observe(); obsErr == nil {
+				if ok, _, _ = o.activePartHint(key, obs, trk, msn, idx); !ok {
+					return nil, partstore.ErrNotFound
+				}
+			}
+			return nil, errPartTimeout
+		case <-ctx.Done():
+			return nil, errClientGone
+		}
+		obs, obsErr = src.Observe()
+		if obsErr != nil {
+			return nil, obsErr
+		}
+		if data, err = src.ReadPart(trk, msn, idx); !errors.Is(err, partstore.ErrNotFound) {
+			return data, err
+		}
+		if ok, tlCh0, tlCh1 = o.activePartHint(key, obs, trk, msn, idx); !ok {
+			return nil, partstore.ErrNotFound
+		}
+	}
+}
+
+// activePartHint reports whether (trk, msn, idx) is the next part of key's healthy source and is
+// actively preload-hinted by at least one registered room timeline, returning up to two timeline
+// change channels to wake on room state transitions.
+func (o *Origin) activePartHint(key EpochKey, obs SourceObservation, trk, msn, idx int) (bool, <-chan struct{}, <-chan struct{}) {
+	if obs.Closed || obs.Refusing || obs.Snapshot.Terminal != nil || trk < 0 || trk >= len(obs.Snapshot.Tracks) {
+		return false, nil, nil
+	}
+	ts := obs.Snapshot.Tracks[trk]
+	if ts.Init == nil || len(ts.Segments) == 0 || (trk >= ipc.TrackAudioA && ts.Phases == nil) {
+		return false, nil, nil
+	}
+	last := ts.Segments[len(ts.Segments)-1]
+	if !last.Closed {
+		if (trk < ipc.TrackAudioA && len(last.Parts) >= 6) || msn != last.MSN || idx != len(last.Parts) {
+			return false, nil, nil
+		}
+	} else if msn != last.MSN+1 || idx != 0 {
+		return false, nil, nil
+	}
+	roomTrk := trk
+	if trk >= ipc.TrackAudioA {
+		roomTrk = RoomTracks - 1
+	}
+	var ch0, ch1 <-chan struct{}
+	matched := false
+	for _, tl := range o.c.snapshot() {
+		tlSnap, tlCh, err := tl.Observe()
+		if err != nil || tlSnap.Closed || tlSnap.Ended || tlSnap.Live == nil || tlSnap.Live.Key != key {
+			continue
+		}
+		if trk >= ipc.TrackAudioA && tlSnap.Live.AudioTrack != trk {
+			continue
+		}
+		if tlSnap.Pending != nil && tlSnap.Pending.HoldStartMonoNS != 0 {
+			continue
+		}
+		hMSN, hIdx, _, ok := nextPart(tlSnap, roomTrk)
+		if !ok || hMSN != msn || hIdx != idx {
+			continue
+		}
+		matched = true
+		if ch0 == nil {
+			ch0 = tlCh
+		} else if ch1 == nil {
+			ch1 = tlCh
+		}
+	}
+	return matched, ch0, ch1
 }
 
 const (

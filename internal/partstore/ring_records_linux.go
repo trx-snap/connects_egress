@@ -150,19 +150,81 @@ func (r *Ring) prepareCommit(rec Record, live bool) (func(), error) {
 	}, nil
 }
 
+const (
+	videoSegmentParts = 6
+	aacSegmentNS      = 2_000_000_000
+	aacScaleNum       = 3
+	aacScaleDen       = 64_000_000
+)
+
+// aacSegmentEnd returns the access-unit end of 1-based audio segment msn from phases, matching
+// ge_aseg_end: P + 2s*msn - A scaled by 48000 / (1024 * 1e9) and rounded with ties upward.
+func aacSegmentEnd(phases ipc.Entry, msn int) (int, bool) {
+	if msn < 1 || phases.PhaseVideo < 0 || phases.PhaseAudio < 0 {
+		return 0, false
+	}
+	uMSN := uint64(msn)
+	if uMSN > math.MaxUint64/aacSegmentNS {
+		return 0, false
+	}
+	span := uMSN * aacSegmentNS
+	pv, pa := uint64(phases.PhaseVideo), uint64(phases.PhaseAudio)
+	if pv > math.MaxUint64-span {
+		return 0, false
+	}
+	mark := pv + span
+	if mark <= pa {
+		return 0, false
+	}
+	delta := mark - pa
+	q, rem := delta/aacScaleDen, delta%aacScaleDen
+	extra := (rem*aacScaleNum + aacScaleDen/2) / aacScaleDen
+	maxInt := uint64(math.MaxInt)
+	if q > (maxInt-extra)/aacScaleNum {
+		return 0, false
+	}
+	end := int(q*aacScaleNum + extra)
+	return end, end > 0
+}
+
+// checkPartBoundary validates e's part index or audio access-unit range against the worker's
+// segment boundary rules and reports whether e completes its segment.
+func checkPartBoundary(video bool, phases *ipc.Entry, e ipc.Entry) (bool, error) {
+	if e.FirstAU > math.MaxInt-e.Payload {
+		return false, fmt.Errorf("%w: first_au %d plus payload %d overflows", ErrInvalidPublication, e.FirstAU, e.Payload)
+	}
+	if video {
+		if e.Index >= videoSegmentParts {
+			return false, fmt.Errorf("%w: video segment %d part %d exceeds %d parts", ErrInvalidPublication, e.MSN, e.Index, videoSegmentParts)
+		}
+		return e.Index == videoSegmentParts-1, nil
+	}
+	if phases == nil {
+		return false, fmt.Errorf("%w: audio track %d has no phases", ErrInvalidPublication, e.Track)
+	}
+	endAU, ok := aacSegmentEnd(*phases, e.MSN)
+	if !ok {
+		return false, fmt.Errorf("%w: audio segment %d has no valid end for phases %d/%d", ErrInvalidPublication, e.MSN, phases.PhaseVideo, phases.PhaseAudio)
+	}
+	partEnd := e.FirstAU + e.Payload
+	if partEnd > endAU {
+		return false, fmt.Errorf("%w: audio segment %d part %d ends at access unit %d past segment end %d", ErrInvalidPublication, e.MSN, e.Index, partEnd, endAU)
+	}
+	return partEnd == endAU, nil
+}
+
 // preparePart checks fragment continuity and timing of part e on t.
 func (r *Ring) preparePart(t *track, e ipc.Entry) (func(), error) {
 	if t.init == nil {
 		return nil, fmt.Errorf("%w: track %d has no init", ErrInvalidPublication, e.Track)
 	}
 	video := e.Track < ipc.TrackAudioA
-	switch {
-	case !video && t.phases == nil:
-		return nil, fmt.Errorf("%w: audio track %d has no phases", ErrInvalidPublication, e.Track)
-	case video && e.FragmentStart && !e.Independent:
+	if video && e.FragmentStart && !e.Independent {
 		return nil, fmt.Errorf("%w: video segment %d must start independent", ErrInvalidPublication, e.MSN)
-	case e.FirstAU > math.MaxInt-e.Payload:
-		return nil, fmt.Errorf("%w: first_au %d plus payload %d overflows", ErrInvalidPublication, e.FirstAU, e.Payload)
+	}
+	closeSeg, err := checkPartBoundary(video, t.phases, e)
+	if err != nil {
+		return nil, err
 	}
 	prev := t.last
 	var open *segment
@@ -217,6 +279,9 @@ func (r *Ring) preparePart(t *track, e ipc.Entry) (func(), error) {
 			t.segments = append(t.segments, seg)
 		}
 		seg.duration, seg.end = dur, end
+		if closeSeg {
+			seg.closed = true
+		}
 		seg.parts = append(seg.parts, e)
 		t.last, t.end = copyEntry(&e), end
 	}, nil

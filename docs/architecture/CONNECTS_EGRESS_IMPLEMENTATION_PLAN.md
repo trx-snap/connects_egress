@@ -33,6 +33,7 @@
 3. A spectator's playback URL never changes for the life of a room: solo → battle → solo, worker crash, region bridge.
 4. A worker failure affects exactly one stream and recovers without spectator action.
 5. Multi-region from day one, with no client release needed to add a region (D3 routing contract).
+6. **Platform portability & vendor independence:** Portability across Linux amd64 and arm64 is an architectural design and validation target (cross-platform reliability is not assumed proven). Hardware acceleration is optional and capability-probed, with software encoding (`x264enc`, with `x265enc` deferred as an optional future backend) serving as the intended baseline and fallback when required GStreamer plugins are available; runtime package availability and encoding performance must be validated per target distribution and architecture (not all distributions bundle these plugins). Capacity is measured and calibrated per deployed node model without code rewrites. The initial launch target of under €300/month (evaluated on the budget-conscious Hetzner AX102 launch candidate, not a permanent product constraint) is a planning assumption based on dated source prices, subject to current quote and traffic validation.
 
 **Non-Goals (this plan)**
 - Client-side simulcast (still forbidden; single 720×1280 publisher invariant).
@@ -72,7 +73,7 @@
 │  connects-egress bridge connects-egress worker (per source, Cgo+GStreamer)  │
 │  (per match, pure Go)   ├─ ingest N hosts (LiveKit Go SDK, §7.1)            │
 │         ▲               ├─ decode → tight Atlas compose (video box, §4)     │
-│         │               ├─ ONE video ladder (HEVC 3 rungs, §8)              │
+│         │               ├─ ONE video ladder (H.264 3 rungs, §8)             │
 │         │               ├─ N per-room audio mixes (AAC, §5)                 │
 │         │               └─ writes CMAF parts → supervisor Part Store (IPC)  │
 └─────────┼──────────────────────────────────────────────────────────────────┘
@@ -210,10 +211,9 @@ The worker produces **one AAC mix per room** in the match:
 ```
 /live/{room}/master.m3u8                     ← stable, fetched once
   #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",URI="a.m3u8",DEFAULT=YES
-  #EXT-X-STREAM-INF:...CODECS="hvc1.1.6.L93.B0,mp4a.40.2",AUDIO="aud"  → vhi.m3u8
+  #EXT-X-STREAM-INF:...CODECS="avc1.4d401f,mp4a.40.2",AUDIO="aud"     → vhi.m3u8
   #EXT-X-STREAM-INF:...                                               → vmid.m3u8
   #EXT-X-STREAM-INF:...                                               → vlo.m3u8
-  (#EXT-X-STREAM-INF: H.264 web rung, only when enabled — §8.4)
 /live/{room}/vhi.m3u8   ← room timeline; part URIs point at shared source parts
 /live/{room}/a.m3u8     ← room timeline for this room's audio mix
 /media/{source_id}/{epoch}/{rendition}/{msn}.{part}.m4s   ← immutable, shared
@@ -296,7 +296,7 @@ Correction from v1: the claim that "frames never cross Go↔C" is impossible und
 
 ### 7.3 Video Ladder and Keyframe Alignment (P0 correction)
 `key-int-max` only caps the GOP. Scene-cut detection can add extra keyframes, which de-align the rungs and break ABR switching. Rules:
-1. **Scene-cut disabled** on every software encoder (x265 `scenecut=0`, x264 `scenecut=0`; hardware encoders: the equivalent setting, verified per backend).
+1. **Scene-cut disabled** on every software encoder (x264 `scenecut=0`; if HEVC is evaluated in the future: x265 `scenecut=0`; hardware encoders: the equivalent setting, verified per backend).
 2. **One keyframe clock:** the worker sends a GStreamer force-key-unit event to **all** encoder branches at every 1.000 s of pipeline running time. Encoders run with `key-int-max` ≥ 31 as a safety cap only.
 3. Acceptance: identical IDR PTS across all rungs for 1 hour of continuous encoding (Gate G-A).
 
@@ -314,7 +314,7 @@ LiveKit clients may publish VP8 unless configured otherwise. Vanguard publishers
 | `EXT-X-RENDITION-REPORT` | Every other rendition of the room | Needed for fast ABR switching |
 | `EXT-X-PROGRAM-DATE-TIME` | Every segment, from an NTP-disciplined clock (chrony) | Drives the event sync in §10 |
 | Window | 24 s (12 segments), configurable | Must exceed `CAN-SKIP-UNTIL` so delta updates actually skip |
-| Container | CMAF fMP4; HEVC sample entry **`hvc1`** (parameter sets in sample description) | `hvc1` required for Apple playback (`NOT_VERIFIED` here; checked in G-L with Apple's validator) |
+| Container | CMAF fMP4; H.264 sample entry **`avc1`** (parameter sets in sample description) | `avc1` standard sample entry for H.264 playback (`hvc1` required if HEVC is evaluated in the future; checked in G-L) |
 | `PART-TARGET` | 0.334 | Video parts are 0.3333 s; rounding must never exceed the target |
 | Audio framing | AAC-LC 48 kHz, 1024-sample frames (21.33 ms) | A 0.333 s part is not a whole number of AAC frames. Audio parts = **15 frames (0.320 s)**. Each audio segment ends on the AAC frame nearest the video segment end (± 1 frame), and audio PDT/`tfdt` come from the running sample count, so drift is zero. Validated in G-L |
 
@@ -324,32 +324,38 @@ LiveKit clients may publish VP8 unless configured otherwise. Vanguard publishers
 
 ---
 
-## 8. Codec Strategy (H.265 target, gated)
+## 8. Codec Strategy (H.264 Primary Baseline, HEVC Deferred)
 
-### 8.1 Decision
-**HEVC is the target primary codec** for the mobile ladder. It ships as primary only after Gates **G-C** (quality/CPU) and **G-D** (device decode) pass. If either gate fails, the identical pipeline runs with x264 rungs (pure configuration change, §8.3).
+### 8.1 Decision: H.264 Near-Term Primary, HEVC Deferred
+- **Product Priority Decision:** Focus the near-term product and implementation on **H.264 as the single shipping ladder**, deferring HEVC. This is a reversible product priority decision to simplify near-term delivery, eliminate immediate client decode and thermal risks on budget devices, and avoid near-term patent/licensing complexities, not an assertion that HEVC is universally inferior or permanently rejected.
+- **Initial Software Baseline:** Software encoding via `x264enc` serves as the initial baseline across targets, subject to Gate **G-C** calibration (quality, candidate bitrates, preset tuning, and per-mode CPU/capacity calibration) and target-environment validation.
+- **Single 3-Rung Ladder:** The pipeline encodes strictly **one** H.264 video ladder with three quality/resolution rungs (`hi`, `mid`, `lo`), with force-aligned IDRs across rungs (§7.3). This single ladder serves both mobile and web clients natively.
+- **Deferred HEVC Re-entry Criteria:** HEVC remains preserved as an optional future evaluation path. Re-entry requires:
+  1. Passing Gate **G-C** (demonstrating verifiable quality/bitrate efficiency advantages under real-time low-latency constraints on recorded atlas content).
+  2. Passing deferred Gate **G-D** (proving hardware acceleration support, 30-minute thermal stability at 30 fps, and single-decoder ceiling on budget Android devices and minimum iOS devices).
+  3. Passing Legal Gate **D8** (formal review of content distribution royalties across patent pools and licensors, and server-side GPLv2/commercial terms for x265).
 
-### 8.2 Corrections to v1 claims
-| v1 claim | Correction |
+### 8.2 Historical Context and Directional Evidence (Deferred Re-entry Facts)
+| Area / Claim | Historical Finding & Deferred Re-entry Relevance |
 | :--- | :--- |
-| "99%+ of Android devices decode HEVC in **hardware** (CDD mandate)" | **Withdrawn.** The Android CDD requires HEVC Main Profile Level 3 *support* but does not require hardware; budget devices may use a software decoder (`VERIFIED_SOURCE`, CDD §5). G-D must check `MediaCodecInfo.isHardwareAccelerated()` (API 29+) on target low-end Unisoc/MediaTek devices plus SM-A566B, including 30-minute thermal runs. |
-| "100% of iPhones decode HEVC in hardware" | `NOT_VERIFIED`; G-D covers the iOS minimum supported device. |
-| "~41% bandwidth saving; 950/450/220 kbps" | **Planning target only.** HEVC efficiency gains come from slower presets; `ultrafast`/`zerolatency` gives back part of the gain and costs more CPU than x264 `veryfast`. G-C sets the final bitrates. |
-| "100% royalty-free for free streaming" | **Withdrawn.** Pool terms for content distribution must be confirmed by counsel, including licensors outside the pools. Added to Legal Gate D8. x265 is GPLv2/commercial; server-side use without distribution goes to counsel under D8. |
+| Android HEVC Hardware Decode | **Withdrawn as universal assumption; retained as future G-D re-entry criterion.** The Android CDD requires HEVC Main Profile Level 3 *support* but does not mandate hardware decoding (`VERIFIED_SOURCE`, CDD §5). Budget devices frequently rely on software decoding. For any future HEVC reconsiderations, Gate G-D must verify `MediaCodecInfo.isHardwareAccelerated()` (API 29+) on budget target devices (e.g. Unisoc, MediaTek) and `SM-A566B` alongside 30-minute thermal runs. This does not block the H.264-first shipping path. |
+| iOS HEVC Hardware Decode | **`NOT_VERIFIED`; retained as future G-D re-entry criterion.** iOS hardware decode coverage across the minimum supported iPhone generation remains an evaluation item for deferred Gate G-D. |
+| Bitrate Savings vs. CPU Tradeoff | **Directional historical evidence only; non-decisive.** Prior synthetic tests demonstrated that aggressive real-time HEVC presets (`ultrafast`/`zerolatency`) compromise compression efficiency while imposing higher CPU overhead than x264 `veryfast`. Gate G-C calibrates H.264 bitrates, presets, and per-mode CPU capacity directly. Prior HEVC data is retained as historical context. All final bitrates and capacity figures remain `NOT_VERIFIED` until measured on representative content and deployed hardware. |
+| HEVC / x265 Licensing & Royalties | **Deferred to Legal Gate D8.** Content distribution patent pool terms (Access Advance, MPEG LA / Via LA, Velos Media) and unpooled licensors, as well as server-side GPLv2 vs. commercial licensing for x265, are deferred and become relevant only if HEVC is reconsidered for deployment. |
 
 ### 8.3 Encoder Backend Factory
-`EncoderBackend` interface selected at worker start from a probed capability list. On a mid-stream backend failure (session error), the worker falls back to the next backend at the next GOP boundary via a new epoch (a discontinuity, §5.3).
+`EncoderBackend` interface selected at worker start from a probed capability list. On a mid-stream backend failure (session error), the worker falls back to the next backend at the next GOP boundary via a new epoch (a discontinuity, §5.3). Hardware acceleration is optional and capability-probed; software encoding (`x264enc`, with `x265enc` deferred as an optional future backend) serves as the intended baseline and fallback across Linux amd64 and arm64 targets when required GStreamer plugins are available. Portability across Linux amd64 and arm64 is an architectural design and validation target; runtime package availability and encoding performance must be validated per target rather than assumed proven.
 
 | Priority | Backend | Notes |
 | :--- | :--- | :--- |
-| 1 | NVENC (`nvh265enc` / `nvh264enc`) | Needs an NVIDIA GPU. Decode (NVDEC) and compose (GPU compositor) must also move to the GPU, otherwise CPU stays the bottleneck. |
-| 2 | VAAPI (`vah265enc` / `vah264enc`) | AMD/Intel GPUs. Availability on the target server is `NOT_VERIFIED`. |
-| 3 | Software (`x265enc` / `x264enc`) | Launch baseline on Hetzner AX102 (AMD, no discrete GPU). |
+| 1 | NVENC (`nvh264enc` / future `nvh265enc`) | Needs an NVIDIA GPU. Decode (NVDEC) and compose (GPU compositor) must also move to the GPU, otherwise CPU stays the bottleneck. |
+| 2 | VAAPI (`vah264enc` / future `vah265enc`) | AMD/Intel GPUs. Optional capability-probed acceleration; availability on target server is `NOT_VERIFIED`. |
+| 3 | Software (`x264enc` baseline / deferred `x265enc`) | Intended baseline and fallback across Linux amd64 and arm64 targets when required GStreamer plugins are available (runtime package availability and performance must be validated per target; not all distributions include these plugins); initial baseline on the budget-conscious Hetzner AX102 launch candidate (AMD bare metal, no discrete GPU, not a permanent product constraint). |
 
 Each backend has its **own tuned rate-control profile**. The v1 "zero changes" claim is withdrawn: switching backends means re-tuning, but not changing pipeline or business code.
 
-### 8.4 H.264 Web Rung — lazy
-The H.264 web rung is **off by default** and starts only when a client that cannot play HEVC requests the room (player capability query parameter). It stops 60 s after the last such client leaves. This saves the 4th encode for mobile-only audiences. Start-up cost: about one GOP plus a playlist cycle (`TARGET` ≤ 3 s).
+### 8.4 Single Initial Ladder (Lazy Web Fallback Retired)
+Because H.264 is the near-term primary codec across all mobile clients, modern desktop and mobile web browsers play the standard H.264 CMAF fMP4 / LL-HLS stream natively. The obsolete concept of a 4th, lazily-spawned H.264 web fallback rung is withdrawn. No dual ladder or replacement fallback rung is created; the engine produces strictly the single 3-tier H.264 ladder (`hi`, `mid`, `lo`). This eliminates dynamic fallback spin-up latency, playlist branch complexity, and opportunistic 4th-rung encode overhead.
 
 ### 8.5 Per-Geometry Ladders (v2.3)
 Each tier scales the atlas to roughly 100 % / 80 % / 50 % per side. **Invariant:** `hi` and `mid` dimensions are mod16; `lo` dimensions are at least mod8 (avoids hardware-encoder rejection and chroma edge artefacts).
@@ -374,7 +380,7 @@ Each tier scales the atlas to roughly 100 % / 80 % / 50 % per side. **Invariant:
 ### 9.2 Part Store (crash continuity)
 - The **supervisor owns** all media part memory: `memfd`-backed ring buffers per source and rendition, mapped read-write into the worker and read-only into HTTP serving.
 - **Recovery after a supervisor restart:** each memfd is also stored in systemd's file-descriptor store (`FileDescriptorStoreMax=`, `sd_pid_notify_with_fds`, named by `source_id/epoch/rendition`). A restarted supervisor receives the fds back, re-maps them, and re-handshakes with workers over their Unix sockets. If an fd is missing, the affected source restarts as a new epoch (DISCONTINUITY) rather than serving unknown memory.
-- The worker writes a part, then publishes `(source, epoch, rendition, msn, part, offset, len, flags, pts, pdt)` over a Unix socket. A part becomes visible only after that publish (no torn reads).
+- **Durable publication order:** the supervisor persists a reservation before granting an exact writable span; the worker fills only that span, then publishes metadata + digest; the supervisor validates and durably commits before visibility and ACK. A lost connection does not cancel a pending grant; reconnect resumes the exact reservation or acknowledges an identical committed sequence.
 - **Worker crash:** already-published parts stay servable. Timelines stop advancing; blocking requests wait. The supervisor restarts the worker as a **new epoch**, and room timelines append `EXT-X-DISCONTINUITY` (§5.3).
 - Restart target: gap between the last part before the crash and the first after ≤ 3 s (`TARGET`, Gate G-R). The v1 "300 ms" figure had no source and is withdrawn; rejoin + keyframe request + decoder/encoder warm-up dominate.
 
@@ -390,17 +396,16 @@ Each tier scales the atlas to roughly 100 % / 80 % / 50 % per side. **Invariant:
 ### 9.4 Admission Control and Overload Policy
 - Each node advertises **encode budget units** (measured per mode in G-C) to the Region Registry. The orchestrator places sources only where budget remains, with ≥ 15 % headroom (`TARGET`).
 - Overload degradation order (per node, automatic):
-  1. disable lazy H.264 web rungs,
-  2. step the software encoder preset one notch faster,
-  3. refuse new matches (solo still admitted),
-  4. refuse new sources; route to another node or region.
+  1. step the software encoder preset one notch faster (e.g. from configured baseline preset towards faster/ultrafast),
+  2. refuse new matches (solo still admitted),
+  3. refuse new sources; route to another node or region.
 - Never degrade by dropping frames from running streams.
 
 ### 9.5 Persisted State
 Room timeline state (`room_msn`, discontinuity sequence, active source/epoch/offset) is written to a local append-only file on every source switch and once per segment. A supervisor restart therefore resumes numbering exactly, never resetting a room's MSN.
 
 ### 9.6 Deploys
-One supervisor per node (it owns the origin port). A deploy is an **in-place supervisor restart** using the same re-adoption path as a crash (§9.2, §9.3). Workers and bridges are versioned binaries: running ones finish with the version they started with; new sources start the new version. Versioned IPC protocol (`ipc_version` in the handshake); the supervisor supports the current and previous major version, and refuses anything else.
+One supervisor per node (it owns the origin port). A deploy is an **in-place supervisor restart** using the same re-adoption path as a crash (§9.2, §9.3). Workers and bridges are versioned binaries: running ones finish with the version they started with; new sources start the new version. Grant-based IPC wire major 2 is the first deployed baseline; the unreleased legacy v1 session needs no compatibility implementation. Canonical inner Hello, Welcome, Entry and durable records retain format 1 independently of the envelope. For future rolling deployments, the supervisor still supports the current and previous actually deployed majors, and refuses unsupported majors.
 
 ### 9.7 Node Failure (explicit launch risk)
 The two-server launch has **no origin redundancy within a region**. If a node dies, its sources die; hosts reconnect and new sources start on the other node or region (stream URL is stable, spectators see a long gap). Registered in the risk register (§18). It is removed when each region has ≥ 2 media nodes.
@@ -469,15 +474,14 @@ All logs structured JSON keyed by `room_id`, `match_id`, `source_id`, `epoch`.
 v1 room counts assumed x264 and one output per battle, so they are **withdrawn**. Planning formula:
 
 ```
-cost(source) = C_ladder(codec, backend)              ← one video ladder per source
+cost(source) = C_ladder(codec, backend)              ← one video ladder per source (single H.264 ladder)
              + N_hosts × C_decode(720p H.264)
              + C_compose(mode)                        ← scales with atlas pixels (§4.3)
              + N_rooms × C_audio(mix + AAC)
-             + [C_h264_web if lazily enabled]
 ```
 - Under D-A, a 1v1 match costs about **one** video ladder plus one extra decode and one extra audio mix, not two ladders.
 - With the tight atlas, `C_ladder` scales with encoded pixels: a 1v1 ladder encodes ≈ 49 % of a Solo ladder's pixels, Tryon and Quadro ≈ 51 % (§4.3). CPU per pixel is not exactly linear; G-C measures it.
-- Node budget units and per-mode costs are filled in by Gate G-C on the actual AX102. The master architecture's admission cap of "20–25 rooms" is replaced by **measured budget units**.
+- **Node capacity calibration:** Node budget units and per-mode costs are filled in by Gate G-C through empirical measurement on the actual deployed node model (calibrated initially on the budget-conscious Hetzner AX102 launch candidate as an initial baseline rather than a permanent product constraint). Capacity is treated as an empirical measurement for the specific deployed server model: switching hosting vendor or CPU/GPU model requires recalibrating capacity (budget units), not rewriting product or pipeline code. The master architecture's admission cap of "20–25 rooms" is replaced by **measured budget units**.
 
 ---
 
@@ -486,10 +490,10 @@ cost(source) = C_ladder(codec, backend)              ← one video ladder per so
 | Gate | Proves | Acceptance (`TARGET` unless stated) |
 | :--- | :--- | :--- |
 | **G-I** Ingest | Option A vs B; compositor late-frame policy | 4 hosts × 2 h with 15 % loss on one host: other tiles show 0 stalls; Go↔C overhead < 1 % CPU (Option A) |
-| **G-C** Codec/CPU | x265 (ultrafast/superfast) vs x264 (veryfast) on recorded Solo, 1v1, Quadro and Tryon atlas content (§4.3 geometries) | VMAF per tier at candidate bitrates; CPU per source per mode → budget units; final per-geometry ladders (§8.5) |
-| **G-D** Device decode | HEVC hardware decode + 30-min thermals on SM-A566B, ≥ 2 low-end Unisoc/MediaTek devices, minimum iPhone | `isHardwareAccelerated()==true` (Android); no thermal throttle below 30 fps; 1 decoder in use |
+| **G-C** Codec/CPU Calibration | H.264 quality/bitrate/preset tuning and per-mode CPU/capacity calibration on recorded Solo, 1v1, Quadro and Tryon atlas content (§4.3 geometries); x264 software baseline across vendor-neutral target environments (prior x265 comparison data preserved as non-decisive diagnostic evidence) | VMAF per tier at candidate H.264 bitrates; CPU per source per mode → budget units; final per-geometry ladders (§8.5) (all bitrates/capacity remain `NOT_VERIFIED` until measured on deployed hardware) |
+| **G-D** Device decode (Deferred HEVC Re-entry) | Deferred HEVC hardware decode + 30-min thermals on SM-A566B, ≥ 2 low-end Unisoc/MediaTek devices, minimum iPhone; not blocking H.264-first implementation (client device playback validation for H.264 Vanguard player path covered under G-P / Gate 1) | `isHardwareAccelerated()==true` (Android); no thermal throttle below 30 fps; 1 decoder in use (retained as re-entry criteria if HEVC is reconsidered) |
 | **G-A** ABR alignment | Forced-key-unit design; mode-change branch swap | Identical IDR PTS across rungs for 1 h; 50 forced rung switches without a stall; Solo ↔ 1v1 ↔ Tryon swaps with no gap > 1 GOP |
-| **G-L** LL-HLS conformance | Playlists, demuxed audio, audio framing (§7.5), discontinuities, `hvc1`, in-variant resolution change | Apple `mediastreamvalidator` clean; audio/video PDT skew ≤ 1 AAC frame over 1 h; Media3 + AVPlayer play through source switches, worker restart and 50 Solo ↔ battle resolution changes without a stall or ABR reset |
+| **G-L** LL-HLS conformance | Playlists, demuxed audio, audio framing (§7.5), discontinuities, CMAF H.264 (`avc1`; `hvc1` if HEVC reconsidered), in-variant resolution change | Apple `mediastreamvalidator` clean; audio/video PDT skew ≤ 1 AAC frame over 1 h; Media3 + AVPlayer play through source switches, worker restart and 50 Solo ↔ battle resolution changes without a stall or ABR reset |
 | **G-R** Crash continuity | Part Store + epochs + process supervision | `kill -9` worker: gap ≤ 3 s. `systemctl restart` and `kill -9` of the supervisor: workers keep running, memfds recovered from the fd store, no discontinuity, MSN monotonic. Players recover without user action |
 | **G-B** Bridge | FRA↔SIN legs | Host↔host one-way ≤ 350 ms p95; leg loss recovers per §6.5; grant scope verified; **real Flutter host client can see and subscribe to the bridged track** (decides hidden vs filtered-visible participant, §6.3) |
 | **G-P** Player atlas layout | Multi-crop rendering + §4.6 screen spec | All 4 perspectives correct; 1 hardware decoder; ≥ 30 fps render on low-end device; layout checked side by side with the TikTok references on 19.5:9, 20:9 and 16:9 screens; crop anchor tuned |
@@ -503,10 +507,10 @@ cost(source) = C_ladder(codec, backend)              ← one video ladder per so
 - **Separate repository** `connects-egress` at `/Users/foxy/connects-egress`, branch `main`, outside `/Users/foxy/connects_app`. Its own `AGENTS.md` forbids any change to `connects_app`.
 - **The server code stays in its own repo permanently.** It is a server binary with its own build, CI and deploy cycle, and never merges into the Flutter app. What lands in ConnectsApp at the end is only the integration: player slice, orchestrator/API calls, Centrifugo events.
 - **Contracts are the single source of truth** and live in `connects-egress/contracts/`, versioned with semver: playlist/DATERANGE `X-SLOTS` schema, room/match control API, event JSON schemas, IPC protocol. ConnectsApp pins a contract version; a breaking change bumps the major version.
-- **Lab:** a local macOS lab exists in `lab/` (native `livekit-server --dev` on `127.0.0.1:7880`, GStreamer + `lk` synthetic publishers at 720×1280 @ 30 fps H.264 + 48 kHz Opus, `start_lab.sh` / `verify_lab.sh`). It covers ingest, compose and encode spikes. Gates that need Linux kernel features (memfd, cgroup v2, systemd fd store, `tc netem`: G-R and the loss parts of G-I) run on a Linux lab host (an AX102 or a cheaper dedicated box).
+- **Lab:** a local macOS lab exists in `lab/` (native `livekit-server --dev` on `127.0.0.1:7880`, GStreamer + `lk` synthetic publishers at 720×1280 @ 30 fps H.264 + 48 kHz Opus, `start_lab.sh` / `verify_lab.sh`). It covers ingest, compose and encode spikes. Gates that need Linux kernel features (memfd, cgroup v2, systemd fd store, `tc netem`: G-R and the loss parts of G-I) run on a Linux lab host (such as the budget-conscious AX102 launch candidate or a candidate Linux amd64/arm64 instance, validating kernel features and package availability per target).
 - **Players for gates:** use the existing Vanguard engine (`packages/vanguard_media_engine`) example app pointed at the lab origin, plus Apple `mediastreamvalidator`. Do not fork the player.
 - **Spike code is throwaway:** `spikes/<gate>/` is never imported by `internal/`. Production packages start only after the gate that decides them passes.
-- Licensing: keeping x265 (GPLv2) in a server-only repo simplifies Legal Gate D8 review; it is not distributed in the app.
+- Licensing: keeping server media binaries in a server-only repo simplifies legal review (including Legal Gate D8 if x265/HEVC is reconsidered in the future); no server encoder code is distributed in the client app.
 
 Suggested layout:
 ```
@@ -524,7 +528,7 @@ connects-egress/
 
 **Phase 1 — Solo + 1v1 (including bridge)**
 1. `supervisor`: Part Store, Room Playback Timelines, LL-HLS origin, watchdog, admission, persisted state.
-2. `worker`: ingest (G-I choice), Solo + 1v1 atlas, aligned ladder (G-C codec), per-room audio mixes, CMAF parts.
+2. `worker`: ingest (G-I choice), Solo + 1v1 atlas, aligned H.264 ladder (calibrated via G-C), per-room audio mixes, CMAF parts.
 3. `bridge`: same-region multi-node and cross-region legs (hub-and-spoke).
 4. Orchestrator integration: match lifecycle per §11, Region Registry, encode budget units.
 5. Player slice (separate app manifest): atlas perspective layout (G-P), PDT event sync (G-S), discontinuity handling (G-L).
@@ -538,14 +542,14 @@ connects-egress/
 
 | Risk | Severity | Mitigation / Gate |
 | :--- | :--- | :--- |
-| HEVC software decode on budget Android → battery/thermal | High | G-D; x264 fallback ladder by configuration |
-| x265 CPU too high for planned density | High | G-C; preset tuning; GPU backend later |
+| [Deferred] HEVC software decode on budget Android → battery/thermal | Deferred / Low for H.264 launch | Near-term risk eliminated by shipping H.264 primary ladder; deferred Gate G-D preserved as re-entry criteria if HEVC is reconsidered |
+| x264 CPU too high for planned density | Medium | G-C calibration; x264 preset tuning (e.g. veryfast/superfast); GPU backend (VAAPI/NVENC) capability-probed |
 | Discontinuity handling bugs in Media3/AVPlayer LL-HLS | High | G-L; player fixes in Vanguard engine |
 | Single media node per region (no origin redundancy) | High | Accepted for launch; add ≥ 2 nodes per region |
 | Cross-region bridge latency above budget on some routes | Medium | G-B; anchor selection by measured RTT (future) |
 | Flutter multi-texture crop performance on low-end devices | Medium | G-P Option P2 (native crop) |
 | Player stalls or ABR resets on in-variant resolution change (tight atlas) | Medium | G-L; fallback: separate variant sets per geometry announced via a master-playlist reload |
-| HEVC / x265 licensing interpretation | Medium | Legal Gate D8 |
+| [Deferred] HEVC / x265 licensing interpretation | Deferred / Low for H.264 launch | Legal Gate D8; relevant only if HEVC / x265 is reconsidered for future deployment |
 | Contract drift between the `connects-egress` repo and ConnectsApp | Medium | Versioned `contracts/`; app pins a version; lab-generated fixture streams used by app player tests |
 | Bridge publisher not visible to host clients if `hidden` | Medium | G-B; filtered-visible participant fallback (§6.3) |
 
@@ -571,11 +575,11 @@ connects-egress/
 | :--- | :--- | :--- |
 | Self-hosted LiveKit hosts each room on a single node; multi-node scales room count, not room size | LiveKit docs — Distributed setup: https://docs.livekit.io/home/self-hosting/distributed/ | `VERIFIED_SOURCE` (2026-10-06) |
 | `livekitwebrtcsrc` exists in gst-plugins-rs (`rswebrtc`) with a LiveKit signaller | GStreamer docs: https://gstreamer.freedesktop.org/documentation/rswebrtc/ | `VERIFIED_SOURCE` (2026-10-06) |
-| Android CDD requires HEVC Main Profile L3 support, not specifically hardware | Android CDD §5 (Multimedia): https://source.android.com/docs/compatibility/cdd | `VERIFIED_SOURCE` (2026-10-06) |
+| Android CDD requires HEVC Main Profile L3 support, not specifically hardware | Android CDD §5 (Multimedia): https://source.android.com/docs/compatibility/cdd | `VERIFIED_SOURCE` (2026-10-06) (retained as future HEVC re-entry criterion) |
 | LL-HLS tags and blocking-reload semantics | draft-pantos-hls-rfc8216bis: https://datatracker.ietf.org/doc/draft-pantos-hls-rfc8216bis/ | Cited; re-verify exact clauses in G-L |
 | `sync.Pool` items may be removed at any time | https://pkg.go.dev/sync#Pool | Cited; re-verify |
 | Go GC pause characteristics | https://go.dev/doc/gc-guide | Cited; re-verify |
 | LiveKit Egress uses Go + GStreamer `appsrc` | https://github.com/livekit/egress | Cited; re-verify source path in G-I |
 | NGINX `proxy_pass` upstream is HTTP/1.x | https://nginx.org/en/docs/http/ngx_http_proxy_module.html | Cited; re-verify |
-| Apple requires `hvc1` sample entry for HEVC in HLS | Apple HLS Authoring Specification | `NOT_VERIFIED` → G-L |
+| Apple requires `hvc1` sample entry for HEVC in HLS | Apple HLS Authoring Specification | Retained for future HEVC evaluation (G-L tests `avc1` for H.264 primary) |
 | FRA↔SIN server RTT; all latency/CPU/bitrate figures | — | `NOT_VERIFIED` → G-B / G-C |

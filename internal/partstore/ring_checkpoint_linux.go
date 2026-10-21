@@ -4,7 +4,6 @@ package partstore
 
 import (
 	"fmt"
-	"math"
 	"sort"
 
 	"github.com/connectsapp/connects-egress/internal/ipc"
@@ -189,7 +188,7 @@ func (l *checkpointLoad) loadTrack(i int, tc TrackCheckpoint) (*track, error) {
 		var prev *segment
 		var prevPart *ipc.Entry
 		for k, ss := range tc.Segments {
-			seg, err := l.segment(i, ss, prev, prevPart, floor, trackEnd, k == n-1)
+			seg, err := l.segment(i, t.phases, ss, prev, prevPart, floor, trackEnd, k == n-1)
 			if err != nil {
 				return nil, err
 			}
@@ -248,7 +247,7 @@ func (l *checkpointLoad) loadTrack(i int, tc TrackCheckpoint) (*track, error) {
 // segment validates one retained segment of track trk after prev and prevPart, which are nil
 // for the oldest retained segment. floor is the seq every part must exceed, trackEnd the
 // newest segment's end and last whether ss is that newest segment.
-func (l *checkpointLoad) segment(trk int, ss SegmentSnapshot, prev *segment, prevPart *ipc.Entry, floor uint64, trackEnd int64, last bool) (*segment, error) {
+func (l *checkpointLoad) segment(trk int, phases *ipc.Entry, ss SegmentSnapshot, prev *segment, prevPart *ipc.Entry, floor uint64, trackEnd int64, last bool) (*segment, error) {
 	pol := l.r.policy
 	switch {
 	case ss.MSN < 1:
@@ -311,10 +310,15 @@ func (l *checkpointLoad) segment(trk int, ss SegmentSnapshot, prev *segment, pre
 			return nil, fmt.Errorf("%w: video segment %d must start independent", ErrInvalidPublication, ss.MSN)
 		case e.Sequence != uint64(ss.MSN):
 			return nil, fmt.Errorf("%w: track %d segment %d sequence %d", ErrInvalidPublication, trk, ss.MSN, e.Sequence)
-		case e.FirstAU > math.MaxInt-e.Payload:
-			return nil, fmt.Errorf("%w: first_au %d plus payload %d overflows", ErrInvalidPublication, e.FirstAU, e.Payload)
 		case e.Seq <= floor:
 			return nil, fmt.Errorf("%w: track %d part seq %d does not follow its init and phases", ErrInvalidPublication, trk, e.Seq)
+		}
+		closeSeg, err := checkPartBoundary(video, phases, e)
+		if err != nil {
+			return nil, err
+		}
+		if closeSeg && j != len(ss.Parts)-1 {
+			return nil, fmt.Errorf("%w: track %d segment %d continues after final part %d", ErrInvalidPublication, trk, ss.MSN, j)
 		}
 		if prevPart == nil {
 			if ss.MSN == 1 && e.FirstAU != 0 {
@@ -338,6 +342,9 @@ func (l *checkpointLoad) segment(trk int, ss SegmentSnapshot, prev *segment, pre
 		var ok bool
 		if sum, ok = addNS(sum, e.Duration); !ok {
 			return nil, fmt.Errorf("%w: track %d segment %d duration overflows", ErrInvalidPublication, trk, ss.MSN)
+		}
+		if closeSeg {
+			seg.closed = true
 		}
 		seg.parts = append(seg.parts, e)
 		prevPart = copyEntry(&e)

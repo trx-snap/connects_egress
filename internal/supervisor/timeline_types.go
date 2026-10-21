@@ -83,6 +83,7 @@ type RoomBinding struct {
 	AudioTrack    int              `json:"audio_track"`
 	Inits         []ipc.Entry      `json:"inits"`
 	StartMSN      int              `json:"start_msn"`
+	StartUTCNS    *int64           `json:"start_utc_ns,omitempty"`
 	FirstRoomMSN  uint64           `json:"first_room_msn"`
 	Discontinuity bool             `json:"discontinuity"`
 	Ends          []PartRef        `json:"ends,omitempty"`

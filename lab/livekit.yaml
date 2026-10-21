@@ -2,12 +2,19 @@ port: 7880
 bind_addresses:
   - "127.0.0.1"
 rtc:
-  tcp_port: 7881
-  port_range_start: 50000
-  port_range_end: 50050
+  tcp_port: 0
+  udp_port: 7882
+  node_ip: 127.0.0.1
   use_external_ip: false
+  enable_loopback_candidate: true
+  interfaces:
+    includes:
+      - lo0
+  ips:
+    includes:
+      - 127.0.0.1/32
 keys:
-  devkey: secret78901234567890123456789012
+  devkey: secret
 logging:
   json: false
   level: info

@@ -39,6 +39,10 @@ const (
 	originWait  = 10 * time.Second       // first part to both clock origins known
 	terminalMax = 5 * time.Second
 
+	// videoPartMax is the PART-TARGET the supervisor declares for the video renditions (§7.5,
+	// videoPartTarget in internal/supervisor); a video part over it is never published.
+	videoPartMax = 334 * time.Millisecond
+
 	audioCodecs     = "mp4a.40.2"
 	videoQueueBytes = 2 << 20 // appsrc backlog over which a video sample is rejected
 	audioQueueBytes = 256 << 10
@@ -218,6 +222,7 @@ func (r *runner) generate(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			clean, endReason = true, "stop requested"
+			r.log.Printf("[diag] run=%s room-end detected: stop requested at %s", r.o.Run, time.Now().UTC().Format(time.RFC3339Nano))
 		case err := <-in.joined:
 			joining--
 			if err != nil {
@@ -227,24 +232,32 @@ func (r *runner) generate(ctx context.Context) error {
 			}
 		case reason := <-in.ended:
 			clean, endReason = true, reason
+			r.log.Printf("[diag] run=%s room-end detected: reason=%q at %s", r.o.Run, reason, time.Now().UTC().Format(time.RFC3339Nano))
 		case <-in.ctx.Done():
 			cause = context.Cause(in.ctx)
+			r.log.Printf("[diag] run=%s ingest ctx done: cause=%v at %s", r.o.Run, cause, time.Now().UTC().Format(time.RFC3339Nano))
 		case err := <-busDone:
 			busLive = false
 			if cause = err; err == nil {
 				cause = errors.New("the pipeline reached EOS before the room ended")
 			}
+			r.log.Printf("[diag] run=%s bus event during run: err=%v cause=%v at %s", r.o.Run, err, cause, time.Now().UTC().Format(time.RFC3339Nano))
 		case err := <-readerDone:
 			readers--
 			if cause = err; err == nil {
 				cause = errors.New("a reader drained before EOS was sent")
 			}
+			r.log.Printf("[diag] run=%s readerDone during run: err=%v cause=%v at %s", r.o.Run, err, cause, time.Now().UTC().Format(time.RFC3339Nano))
 		}
 	}
 	if clean {
 		r.log.Printf("room ending: %s", endReason)
+		r.log.Printf("[diag] run=%s stopFeeding starting at %s", r.o.Run, time.Now().UTC().Format(time.RFC3339Nano))
 		in.stopFeeding()
+		r.log.Printf("[diag] run=%s stopFeeding finished at %s", r.o.Run, time.Now().UTC().Format(time.RFC3339Nano))
+		r.log.Printf("[diag] run=%s endOfStream submitting at %s", r.o.Run, time.Now().UTC().Format(time.RFC3339Nano))
 		cause = r.pipe.endOfStream()
+		r.log.Printf("[diag] run=%s endOfStream result: err=%v at %s", r.o.Run, cause, time.Now().UTC().Format(time.RFC3339Nano))
 		drain := time.NewTimer(drainGrace)
 		busEOS := false
 		for cause == nil && !(busEOS && readers == 0) {
@@ -256,13 +269,16 @@ func (r *runner) generate(ctx context.Context) error {
 				} else {
 					busEOS = true
 				}
+				r.log.Printf("[diag] run=%s drain bus event: err=%v busEOS=%v at %s", r.o.Run, err, busEOS, time.Now().UTC().Format(time.RFC3339Nano))
 			case err := <-readerDone:
 				readers--
 				if err != nil {
 					cause = err
 				}
+				r.log.Printf("[diag] run=%s drain readerDone: readersRemaining=%d err=%v at %s", r.o.Run, readers, err, time.Now().UTC().Format(time.RFC3339Nano))
 			case <-drain.C:
 				cause = fmt.Errorf("EOS did not drain within %v", drainGrace)
+				r.log.Printf("[diag] run=%s drain timeout at %s", r.o.Run, time.Now().UTC().Format(time.RFC3339Nano))
 			}
 		}
 		drain.Stop()
@@ -313,9 +329,24 @@ func (r *runner) generate(ctx context.Context) error {
 	r.mu.Lock()
 	tracks := r.tracks
 	r.mu.Unlock()
-	r.log.Printf("media ended: verified=%v reason=%q parts=%v feeders=%s elapsed=%v", verified, reason,
-		[]int{tracks[0].parts, tracks[1].parts, tracks[2].parts, tracks[3].parts}, in.stats(), time.Since(r.origin).Round(time.Millisecond))
+	r.log.Printf("media ended: verified=%v reason=%q parts=%v feeders=%s elapsed=%v%s", verified, reason,
+		[]int{tracks[0].parts, tracks[1].parts, tracks[2].parts, tracks[3].parts}, in.stats(), time.Since(r.origin).Round(time.Millisecond), withheldTail(r.pipe))
 	return cause
+}
+
+// withheldTail describes the video the pipeline withheld at the stream's end, "" when none: a
+// boundary lacked its key unit and the stream ended within that part, so the frames after the
+// last whole part were never muxed. The cgo pipeline reports it; the nocgo one has nothing.
+func withheldTail(p *pipeline) string {
+	tp, ok := any(p).(interface{ tail() (int64, bool) })
+	if !ok {
+		return ""
+	}
+	au, withheld := tp.tail()
+	if !withheld {
+		return ""
+	}
+	return fmt.Sprintf(" video withheld from access unit %d: no key unit at the stream's end", au)
 }
 
 // read drains the appsink of track into the publisher until it reports EOS: every init, the
@@ -328,6 +359,7 @@ func (r *runner) read(trk int) error {
 			return fmt.Errorf("%s reader: %w", trackLabels[trk], err)
 		}
 		if eos {
+			r.log.Printf("[diag] run=%s reader EOS: track=%d (%s) at %s", r.o.Run, trk, trackLabels[trk], time.Now().UTC().Format(time.RFC3339Nano))
 			return nil
 		}
 		if l == nil {
@@ -466,14 +498,27 @@ func (r *runner) publishPhases(l *pulled) error {
 	return nil
 }
 
-// publishPart publishes one chunk as the next part of its track: a fragment start opens the
-// next segment. An audio chunk has no DTS; its PTS is used.
-func (r *runner) publishPart(trk int, h header, data []byte) error {
+// checkPart is what a chunk must satisfy before publishPart publishes anything of it: a
+// duration, within videoPartMax for a video chunk, and a PTS. A video chunk over videoPartMax
+// would make the playlist declare a part over its own PART-TARGET.
+func checkPart(trk int, h header) error {
 	switch {
 	case h.duration <= 0:
 		return fmt.Errorf("%s: the chunk at access unit %d has duration %d ns", trackLabels[trk], h.firstAU, h.duration)
+	case trk < trackAudio && h.duration > videoPartMax.Nanoseconds():
+		return fmt.Errorf("%s: the chunk at access unit %d has duration %d ns, over the %d ns video part limit", trackLabels[trk], h.firstAU, h.duration, videoPartMax.Nanoseconds())
 	case h.pts < 0:
 		return fmt.Errorf("%s: the chunk at access unit %d has no PTS", trackLabels[trk], h.firstAU)
+	}
+	return nil
+}
+
+// publishPart publishes one chunk as the next part of its track: a fragment start opens the
+// next segment. An audio chunk has no DTS; its PTS is used. A chunk checkPart rejects fails the
+// track before anything is published.
+func (r *runner) publishPart(trk int, h header, data []byte) error {
+	if err := checkPart(trk, h); err != nil {
+		return err
 	}
 	dts := h.dts
 	if dts < 0 {
@@ -513,12 +558,18 @@ func (r *runner) publishPart(trk int, h header, data []byte) error {
 func (r *runner) incomplete() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for trk, t := range r.tracks {
+	return incompleteTracks(r.tracks)
+}
+
+// incompleteTracks is incomplete over the tracks as published: a part on every track and the
+// audio phases are what the ring requires of a verified terminal.
+func incompleteTracks(tracks [rungs + 1]trackState) string {
+	for trk, t := range tracks {
 		if t.parts == 0 {
 			return fmt.Sprintf("ended before %s published a part", trackLabels[trk])
 		}
 	}
-	if !r.tracks[trackAudio].phases {
+	if !tracks[trackAudio].phases {
 		return "ended before the audio phases were published"
 	}
 	return ""

@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connects Egress — LL-HLS Sub-2s Web Player</title>
+  <meta name="description" content="Ultra low-latency (<2.0s) LL-HLS web player consuming connects-egress CMAF streaming packager.">
+  <link rel="stylesheet" href="styles.css">
+  <!-- Vendor Hls.js with CDN fallback -->
+  <script src="vendor/hls.min.js"></script>
+  <script>
+    if (typeof Hls === 'undefined') {
+      document.write('<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"><\/script>');
+    }
+  </script>
+</head>
+<body>
+  <div class="app-container">
+
+    <!-- Header -->
+    <header class="app-header glass">
+      <div class="brand-section">
+        <div class="brand-logo-icon">
+          <svg viewBox="0 0 24 24"><path d="M4 6.5v11l9-5.5-9-5.5zm11 0v11l5-3.5v-4l-5-3.5z"/></svg>
+        </div>
+        <div class="brand-title-group">
+          <h1>
+            Connects Egress LL-HLS
+            <span class="badge-pill badge-target" id="headerLatencyBadge">TARGET &lt; 2.0s</span>
+            <span class="badge-pill badge-h3" id="protocolBadge">HTTP/3 (QUIC)</span>
+          </h1>
+          <div class="sub-title">Unified CMAF Media Packager &bull; Part-Level Low-Latency Engine</div>
+        </div>
+      </div>
+
+      <div class="header-status-group">
+        <div class="status-beacon" id="upstreamBeacon">
+          <div class="radar-dot" id="radarDot"></div>
+          <span id="upstreamStatusText">Connecting...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Stream Configuration Bar -->
+    <section class="stream-config-card glass">
+      <div class="config-row">
+        <div class="input-group">
+          <label for="egressOriginInput">Egress Origin</label>
+          <input type="text" id="egressOriginInput" value="https://localhost:3053" placeholder="https://localhost:3053">
+        </div>
+
+        <div class="input-group" style="max-width: 280px;">
+          <label for="roomIdInput">Room ID</label>
+          <input type="text" id="roomIdInput" value="room_android_smoke" placeholder="room_name">
+        </div>
+
+        <div class="input-group" style="max-width: 220px;">
+          <label for="connectionModeSelect">Route Mode</label>
+          <select id="connectionModeSelect">
+            <option value="proxy" selected>Smart Proxy (CORS-Safe)</option>
+            <option value="direct">Direct Origin</option>
+          </select>
+        </div>
+
+        <div class="input-group" style="max-width: 240px;">
+          <label for="latencyProfileSelect">Profile</label>
+          <select id="latencyProfileSelect">
+            <option value="ultra">Ultra LL (&lt; 1.2s)</option>
+            <option value="balanced" selected>Standard LL (&lt; 1.8s)</option>
+            <option value="safe">Stable LL (&lt; 2.5s)</option>
+          </select>
+        </div>
+
+        <button class="btn btn-primary" id="connectBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
+          Connect &amp; Play
+        </button>
+      </div>
+
+      <div class="presets-chips">
+        <span class="chip-label">Quick Presets:</span>
+        <button class="chip active" data-origin="https://localhost:3053" data-room="room_android_smoke">HTTP/3 Proxy (:3053)</button>
+        <button class="chip" data-origin="https://192.168.0.136:18443" data-room="room_android_smoke">HTTP/3 Direct (:18443)</button>
+        <button class="chip" data-origin="http://127.0.0.1:18080" data-room="room_android_smoke">Local Origin (127.0.0.1:18080)</button>
+      </div>
+    </section>
+
+    <!-- Main Dashboard Grid -->
+    <main class="main-grid">
+
+      <!-- Left Column: Video Viewport -->
+      <section class="player-card glass">
+        <div class="player-viewport-wrapper">
+          <video id="videoPlayer" playsinline autoplay muted></video>
+
+          <!-- Top Overlay: Live Pill & Floating Target Latency -->
+          <div class="viewport-top-overlay">
+            <div class="overlay-pill overlay-live-jump" id="liveJumpBtn" title="Click to jump to immediate live edge">
+              <span class="radar-dot live" id="videoLiveDot"></span>
+              <span id="liveJumpText">LIVE</span>
+            </div>
+
+            <div class="overlay-pill" id="overlayLatencyPill">
+              <span>LATENCY:</span>
+              <span id="overlayLatencyVal" style="color: var(--accent-emerald);">-- s</span>
+            </div>
+          </div>
+
+          <!-- Bottom Overlay Controls -->
+          <div class="viewport-bottom-controls">
+            <div class="controls-row">
+              <div class="controls-left">
+                <button class="ctrl-btn" id="playPauseBtn" title="Play / Pause">
+                  <svg id="playIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                  <svg id="pauseIcon" viewBox="0 0 24 24" style="display:none;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                </button>
+
+                <button class="ctrl-btn" id="muteBtn" title="Mute / Unmute">
+                  <svg id="volumeHighIcon" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+                  <svg id="volumeMuteIcon" viewBox="0 0 24 24" style="display:none;"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+                </button>
+                <input type="range" class="volume-slider" id="volumeSlider" min="0" max="1" step="0.05" value="0">
+              </div>
+
+              <div class="controls-right">
+                <div class="overlay-pill" style="padding: 3px 8px; font-size: 11px;">
+                  <label for="abrSelect" style="margin-right: 4px; color: var(--text-muted);">RUNG:</label>
+                  <select id="abrSelect" style="background:transparent; border:none; color:#fff; font-family:var(--font-mono); font-size:11px; outline:none; cursor:pointer;">
+                    <option value="-1" selected>AUTO (ABR)</option>
+                    <option value="0">vhi (720p)</option>
+                    <option value="1">vmid (576p)</option>
+                    <option value="2">vlo (360p)</option>
+                  </select>
+                </div>
+
+                <button class="ctrl-btn" id="fullscreenBtn" title="Fullscreen">
+                  <svg viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Player Footer Info -->
+        <div class="player-footer">
+          <div class="player-footer-item">
+            <span>Active Playlist:</span>
+            <span class="val" id="activePlaylistDisplay">master.m3u8</span>
+          </div>
+          <div class="player-footer-item">
+            <span>Video Time:</span>
+            <span class="val" id="currentTimeDisplay">0.00s</span>
+          </div>
+          <div class="player-footer-item">
+            <span>Sync Mode:</span>
+            <span class="val" id="syncStatusDisplay" style="color: var(--accent-emerald);">LL-HLS Active</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Real-time Telemetry Dashboard -->
+      <section class="telemetry-column">
+
+        <!-- KPI Hero Cards Grid -->
+        <div class="kpi-grid">
+          <!-- KPI 1: Latency -->
+          <div class="kpi-card hero-latency glass" id="kpiLatencyCard">
+            <div class="kpi-header">
+              <span class="kpi-title">Live Edge Latency</span>
+              <span class="kpi-subtag">&lt; 2.0s CEILING</span>
+            </div>
+            <div class="kpi-value-row">
+              <span class="kpi-value" id="kpiLatencyVal">--</span>
+              <span class="kpi-unit">sec</span>
+            </div>
+            <div class="kpi-footer-note" id="kpiLatencyNote">
+              <span>Syncing with CMAF live edge...</span>
+            </div>
+          </div>
+
+          <!-- KPI 2: Playback Catch-up Speed -->
+          <div class="kpi-card glass">
+            <div class="kpi-header">
+              <span class="kpi-title">Catch-Up Clock</span>
+              <span class="kpi-subtag">SPEED REGULATOR</span>
+            </div>
+            <div class="kpi-value-row">
+              <span class="kpi-value" id="kpiSpeedVal">1.00</span>
+              <span class="kpi-unit">&times;</span>
+            </div>
+            <div class="kpi-footer-note" id="kpiSpeedNote">
+              <span id="kpiSpeedStatus">Target Lock</span>
+            </div>
+          </div>
+
+          <!-- KPI 3: Forward Buffer -->
+          <div class="kpi-card glass">
+            <div class="kpi-header">
+              <span class="kpi-title">Forward Buffer</span>
+              <span class="kpi-subtag">CONSTRAINED</span>
+            </div>
+            <div class="kpi-value-row">
+              <span class="kpi-value" id="kpiBufferVal">--</span>
+              <span class="kpi-unit">sec</span>
+            </div>
+            <div class="kpi-footer-note">
+              <span>Target: 0.6s &ndash; 1.5s</span>
+            </div>
+          </div>
+
+          <!-- KPI 4: Active Ladder & Resolution -->
+          <div class="kpi-card glass">
+            <div class="kpi-header">
+              <span class="kpi-title">Ladder Rung</span>
+              <span class="kpi-subtag">MOD16</span>
+            </div>
+            <div class="kpi-value-row">
+              <span class="kpi-value" id="kpiResolutionVal" style="font-size: 24px;">720&times;1280</span>
+            </div>
+            <div class="kpi-footer-note">
+              <span id="kpiBitrateVal">2,628 kbps (vhi)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Real-Time Latency Sparkline Chart -->
+        <div class="chart-card glass">
+          <div class="chart-header">
+            <span class="panel-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
+              Live Latency History (Under 2.0s Performance)
+            </span>
+            <div class="chart-legend">
+              <div class="legend-item">
+                <div class="legend-color measured"></div>
+                <span>Current Latency</span>
+              </div>
+              <div class="legend-item">
+                <div class="legend-color threshold"></div>
+                <span>2.0s Ceiling</span>
+              </div>
+            </div>
+          </div>
+          <div class="canvas-container">
+            <canvas id="latencyChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Specifications & Live Event Stream -->
+        <div class="details-grid">
+          <!-- Pipeline Specifications -->
+          <div class="panel-card glass">
+            <div class="panel-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
+              CMAF LL-HLS Packaging Specs
+            </div>
+            <div class="spec-list">
+              <div class="spec-row">
+                <span class="spec-key">Transport:</span>
+                <span class="spec-val" id="specTransportVal" style="color: var(--accent-cyan);">HTTP/3 (QUIC / UDP)</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">HLS Protocol:</span>
+                <span class="spec-val">RFC 8216bis Low-Latency</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">Video Part Target:</span>
+                <span class="spec-val">0.334 s (10 frames @ 30fps)</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">Audio Part Target:</span>
+                <span class="spec-val">0.320 s (15 AAC frames @ 48kHz)</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">Full Segment:</span>
+                <span class="spec-val">2.000 s (2 GOPs, 6 parts)</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">Server Hold-Back:</span>
+                <span class="spec-val">PART-HOLD-BACK = 1.002 s</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">Codecs:</span>
+                <span class="spec-val" id="specCodecsDisplay">avc1.64001f, mp4a.40.2</span>
+              </div>
+              <div class="spec-row">
+                <span class="spec-key">PDT Wall-Clock Age:</span>
+                <span class="spec-val" id="specPdtAgeVal">-- s</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Live Event Terminal -->
+          <div class="panel-card glass">
+            <div class="panel-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V8h16v10zm-2-1h-6v-2h6v2zM7.5 17l-1.41-1.41L8.67 13l-2.58-2.59L7.5 9l4 4-4 4z"/></svg>
+              Part &amp; Segment Event Stream
+            </div>
+            <div class="terminal-window" id="eventTerminal">
+              <div class="terminal-line">
+                <span class="terminal-time">[00:00:00]</span>
+                <span class="terminal-tag">INIT</span>
+                <span class="terminal-msg">Connects Egress Web Player ready.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </section>
+    </main>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
